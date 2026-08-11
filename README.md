@@ -40,3 +40,15 @@ finishes, refresh the board and choose that game.
 
 After updating to a version with the pitcher outlook, run `python3
 sync_statcast.py --all` once so the new strikeout and out fields are populated.
+
+The current version also calculates pitcher workload, a workload-adjusted K
+projection, and hitter pitch-quality signals (K%, whiff%, hard-hit%, and a
+conservative barrel proxy) from those same feeds. Run the all-slate sync once
+again after this update to populate them. MLB Gameday does not provide official
+Statcast xwOBA, so the board intentionally does not invent an xwOBA value.
+
+The all-slate sync also accumulates home-plate umpire outcomes from completed
+MLB feeds. An umpire is labeled pitcher-friendly, hitter-friendly, or neutral
+only after the live game feed names the home-plate umpire and the local cache
+contains at least eight of that umpire's games; otherwise the board reports the
+assignment or limited-sample status without guessing.
