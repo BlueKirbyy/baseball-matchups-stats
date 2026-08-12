@@ -129,6 +129,13 @@ CREATE TABLE IF NOT EXISTS gameday_umpire_game (
   pitches INTEGER NOT NULL,
   PRIMARY KEY (season, game_pk, umpire_id)
 );
+CREATE TABLE IF NOT EXISTS odds_slate_cache (
+  cache_key TEXT PRIMARY KEY,
+  checked_at REAL NOT NULL,
+  changed_at REAL NOT NULL,
+  payload TEXT NOT NULL,
+  message TEXT
+);
 """
 
 def connect():

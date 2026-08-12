@@ -1,0 +1,3 @@
+.env
+.gameday_cache/
+__pycache__/

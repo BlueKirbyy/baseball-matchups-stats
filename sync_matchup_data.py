@@ -296,7 +296,8 @@ def sync_game(game_pk, season, workers):
     if failures: print(f"{len(failures)} game feeds failed; rerun safely to retry them.")
 
 def todays_game_pks():
-    date = datetime.now(timezone.utc).date().isoformat()
+    # Match the board's local-calendar slate instead of rolling over at UTC midnight.
+    date = datetime.now().astimezone().date().isoformat()
     schedule = mlb("/schedule", {"sportId": 1, "date": date})
     game_pks = []
     for day in schedule.get("dates", []):

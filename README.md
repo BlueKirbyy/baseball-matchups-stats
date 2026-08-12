@@ -13,6 +13,21 @@ python3 server.py
 
 Then open http://localhost:8000.
 
+## Live game totals and favorites
+
+The board reads the free ESPN public scoreboard feed for a game total and
+moneyline favorite when ESPN publishes them. No key or `.env` file is required.
+This is best-effort public web data, not a supported betting API: a line may be
+missing, delayed, or change without notice.
+
+Odds snapshots are stored in `diamond_intel.db`, so they survive server
+restarts. The server refreshes only when the adaptive cache expires: every 15
+minutes more than three hours before first pitch, every three minutes within
+three hours, and every minute in the final 15 minutes. If a refresh fails, the
+last saved ESPN snapshot remains on screen with a status message. Once no
+scheduled game remains, the pregame snapshot is retained for the rest of the
+slate rather than repeatedly refreshed.
+
 ## Sync research data
 
 In a second Terminal window, sync the game you want. The `gamePk` is in the

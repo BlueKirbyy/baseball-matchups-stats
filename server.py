@@ -1,6 +1,7 @@
 """No-key local server for the Diamond Intel MLB matchup board."""
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import json
+import time
 from datetime import datetime, timezone
 from urllib.parse import urlencode
 from urllib.request import urlopen
@@ -10,6 +11,7 @@ PORT = 8000
 MLB = "https://statsapi.mlb.com/api/v1"
 MLB_GAME_FEED = "https://statsapi.mlb.com/api/v1.1"
 ESPN = "https://site.api.espn.com/apis/site/v2/sports/baseball/mlb"
+ODDS_CACHE = {"key": None, "checked_at": 0, "by_game": {}, "message": None}
 
 def get_json(path, query=None):
     url = MLB + path + ("?" + urlencode(query) if query else "")
@@ -26,9 +28,179 @@ def get_espn_json(path, query=None):
     with urlopen(url, timeout=20) as response:
         return json.loads(response.read())
 
+def local_game_time(value):
+    """Format ESPN's UTC event timestamp in the timezone of this local server."""
+    try:
+        game_time = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return game_time.astimezone().strftime("%a, %b %d · %I:%M %p %Z").replace(" 0", " ")
+    except (TypeError, ValueError):
+        return "Time TBD"
+
+def median(values):
+    ordered = sorted(values)
+    if not ordered:
+        return None
+    middle = len(ordered) // 2
+    return ordered[middle] if len(ordered) % 2 else (ordered[middle - 1] + ordered[middle]) / 2
+
+def number(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+def implied_probability(american_price):
+    """Convert an ESPN American moneyline to its unadjusted implied probability."""
+    price = number(american_price)
+    if price is None or price == 0:
+        return None
+    return (-price / (-price + 100)) if price < 0 else (100 / (price + 100))
+
+def summarize_espn_odds(rows, home, away):
+    """Keep only the total and moneyline from ESPN's public scoreboard response.
+
+    ESPN's endpoint is a best-effort public web feed, not a guaranteed betting
+    API. Its `odds` array generally contains one entry per provider.
+    """
+    totals, over_prices, under_prices = [], [], []
+    home_probs, away_probs, providers = [], [], set()
+    for odds in rows if isinstance(rows, list) else []:
+        if not isinstance(odds, dict):
+            continue
+        provider = odds.get("provider", {})
+        provider_name = provider.get("name") if isinstance(provider, dict) else None
+        if provider_name:
+            providers.add(str(provider_name))
+        total = number(odds.get("overUnder"))
+        if total is not None:
+            totals.append(total)
+        over_price, under_price = number(odds.get("overOdds")), number(odds.get("underOdds"))
+        if over_price is not None:
+            over_prices.append(over_price)
+        if under_price is not None:
+            under_prices.append(under_price)
+        home_odds = odds.get("homeTeamOdds", {})
+        away_odds = odds.get("awayTeamOdds", {})
+        home_probability = implied_probability(home_odds.get("moneyLine")) if isinstance(home_odds, dict) else None
+        away_probability = implied_probability(away_odds.get("moneyLine")) if isinstance(away_odds, dict) else None
+        if home_probability is not None:
+            home_probs.append(home_probability)
+        if away_probability is not None:
+            away_probs.append(away_probability)
+    home_probability, away_probability = median(home_probs), median(away_probs)
+    favorite = None
+    if home_probability is not None and away_probability is not None:
+        favorite = {
+            "team": home if home_probability >= away_probability else away,
+            "probability": max(home_probability, away_probability),
+        }
+    if not totals and not favorite:
+        return None
+    source = ", ".join(sorted(providers)) if providers else "ESPN public feed"
+    return {
+        "total": median(totals),
+        "over_american": median(over_prices),
+        "under_american": median(under_prices),
+        "favorite": favorite,
+        "total_books": len(totals),
+        "moneyline_books": min(len(home_probs), len(away_probs)),
+        "source": source,
+        "updated": "ESPN public feed",
+    }
+
+def odds_ttl_seconds(games):
+    """Refresh less often early in the day and more often near first pitch."""
+    now = datetime.now(timezone.utc)
+    starts = []
+    for game in games:
+        raw = game.get("start_time", "")
+        try:
+            starts.append(datetime.fromisoformat(raw.replace("Z", "+00:00")))
+        except (TypeError, ValueError):
+            pass
+    future = [start for start in starts if start > now]
+    if not future:
+        return 24 * 60 * 60
+    seconds = (min(future) - now).total_seconds()
+    if seconds <= 15 * 60:
+        return 60
+    if seconds <= 3 * 60 * 60:
+        return 180
+    return 900
+
+def read_odds_cache(cache_key):
+    with connect() as db:
+        row = db.execute("SELECT checked_at, changed_at, payload, message FROM odds_slate_cache WHERE cache_key=?", (cache_key,)).fetchone()
+    if not row:
+        return None
+    try:
+        return {"checked_at": row["checked_at"], "changed_at": row["changed_at"], "by_game": {int(game_pk): odds for game_pk, odds in json.loads(row["payload"]).items()}, "message": row["message"]}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+def write_odds_cache(cache_key, checked_at, changed_at, by_game, message):
+    with connect() as db:
+        db.execute("INSERT OR REPLACE INTO odds_slate_cache VALUES (?, ?, ?, ?, ?)", (cache_key, checked_at, changed_at, json.dumps(by_game), message))
+
+def odds_for_slate(games, slate_date):
+    """Persist ESPN's latest public odds snapshot and reuse it adaptively."""
+    now = time.time()
+    ttl = odds_ttl_seconds(games)
+    cache_key = f"espn-public-odds:{slate_date}"
+    if ODDS_CACHE["key"] == cache_key and now - ODDS_CACHE["checked_at"] < ttl:
+        return ODDS_CACHE["by_game"], ODDS_CACHE["message"]
+    saved = read_odds_cache(cache_key)
+    if saved and now - saved["checked_at"] < ttl:
+        ODDS_CACHE.update({"key": cache_key, **saved})
+        return saved["by_game"], saved["message"]
+    try:
+        by_game = {}
+        for game in games:
+            if not game.get("gamePk"):
+                continue
+            summary = summarize_espn_odds(game.get("espn_odds", []), game["home"]["name"], game["away"]["name"])
+            if summary:
+                by_game[game["gamePk"]] = summary
+        message = None if by_game else "ESPN has not published MLB game totals or moneylines for this slate yet."
+        changed_at = now if not saved or saved["by_game"] != by_game or saved["message"] != message else saved["changed_at"]
+        write_odds_cache(cache_key, now, changed_at, by_game, message)
+    except Exception as error:
+        if saved:
+            by_game, message = saved["by_game"], f"Showing saved odds; live refresh failed ({str(error)[:120]})."
+        else:
+            by_game, message = {}, f"Could not read ESPN's public odds feed: {str(error)[:120]}"
+    ODDS_CACHE.update({"key": cache_key, "checked_at": now, "by_game": by_game, "message": message})
+    return by_game, message
+
 def team_batters(team_id):
     roster = get_json(f"/teams/{team_id}/roster", {"rosterType": "active"}).get("roster", [])
     return [p["person"] for p in roster if p.get("position", {}).get("type") != "Pitcher"]
+
+def confirmed_starting_lineup(feed, side):
+    """Return MLB's posted nine-player batting order, or None until it exists."""
+    team = feed.get("liveData", {}).get("boxscore", {}).get("teams", {}).get(side, {})
+    batting_order = team.get("battingOrder", [])
+    players = team.get("players", {})
+    if not isinstance(batting_order, list) or len(batting_order) < 9 or not isinstance(players, dict):
+        return None
+    lineup = []
+    seen = set()
+    for spot, player_id in enumerate(batting_order, start=1):
+        try:
+            player_id = int(player_id)
+        except (TypeError, ValueError):
+            continue
+        if player_id in seen:
+            continue
+        player = players.get(f"ID{player_id}", {})
+        person = player.get("person", {}) if isinstance(player, dict) else {}
+        if not person.get("id") or not person.get("fullName"):
+            continue
+        lineup.append({"id": person["id"], "fullName": person["fullName"], "lineup_order": spot})
+        seen.add(player_id)
+        if len(lineup) == 9:
+            return lineup
+    return None
 
 def game_context(feed, db, season):
     venue = feed.get("gameData", {}).get("venue", {})
@@ -84,12 +256,14 @@ def matchup_research(game_pk):
     home_pitcher, away_pitcher = probable.get("home"), probable.get("away")
     if not home_pitcher or not away_pitcher:
         return {"ready": False, "message": "Both probable starters must be announced before matchup research is available."}
-    home_batters, away_batters = team_batters(teams["home"]["id"]), team_batters(teams["away"]["id"])
+    home_lineup, away_lineup = confirmed_starting_lineup(feed, "home"), confirmed_starting_lineup(feed, "away")
+    home_batters = home_lineup or team_batters(teams["home"]["id"])
+    away_batters = away_lineup or team_batters(teams["away"]["id"])
     season = datetime.now(timezone.utc).year
     with connect() as db:
         latest_sync = db.execute("SELECT * FROM matchup_sync_runs WHERE game_pk=? AND season=?", (game_pk, season)).fetchone()
         context = game_context(feed, db, season)
-        def profile(pitcher, hitters):
+        def profile(pitcher, hitters, lineup_confirmed):
             arsenal = [dict(row) for row in db.execute("SELECT season AS source_season, pitch_name AS pitch, pitch_code AS code, usage, velo, zones FROM gameday_pitcher_arsenal WHERE player_id=? AND season=(SELECT MAX(season) FROM gameday_pitcher_arsenal WHERE player_id=? AND season<=?) ORDER BY pitches DESC", (pitcher["id"], pitcher["id"], season))]
             if not arsenal:
                 return None
@@ -115,23 +289,37 @@ def matchup_research(game_pk):
                         row = exact_rows[pitch["code"]]
                         outcome_row = db.execute("SELECT SUM(strikeouts) AS strikeouts, SUM(outs) AS outs FROM gameday_batter_pitch_velocity WHERE season=? AND player_id=? AND pitch_code=?", (season, batter["id"], pitch["code"])).fetchone()
                         by_pitch[pitch["code"]] = {"pa": row["pa"], "avg": row["avg"], "hr": row["hr"], "strikeouts": outcome_row["strikeouts"] if outcome_row else None, "outs": outcome_row["outs"] if outcome_row else None, "quality": quality_by_pitch.get(pitch["code"]), "range": "all velo"}
-                hitter_rows.append({"name": batter["fullName"], "season": dict(season_row) if season_row else {"pa": "—", "avg": "—", "hr": "—"}, "vs_pitches": by_pitch})
+                hitter_rows.append({"name": batter["fullName"], "lineup_order": batter.get("lineup_order"), "season": dict(season_row) if season_row else {"pa": "—", "avg": "—", "hr": "—"}, "vs_pitches": by_pitch})
             batter_ids = [batter["id"] for batter in hitters]
             placeholders = ",".join("?" for _ in batter_ids)
             opponent_row = db.execute(f"SELECT SUM(pa) AS pa, SUM(strikeouts) AS strikeouts FROM gameday_batter_pitch_velocity WHERE season=? AND player_id IN ({placeholders})", (season, *batter_ids)).fetchone() if batter_ids else None
             opponent_k_rate = (opponent_row["strikeouts"] / opponent_row["pa"]) if opponent_row and opponent_row["pa"] and opponent_row["strikeouts"] is not None else None
-            return {"pitcher": pitcher["fullName"], "arsenal": arsenal, "arsenal_season": arsenal[0]["source_season"], "workload": workload, "opponent_k_rate": opponent_k_rate, "batters": hitter_rows}
-        home = profile(home_pitcher, away_batters)
-        away = profile(away_pitcher, home_batters)
+            return {"pitcher": pitcher["fullName"], "arsenal": arsenal, "arsenal_season": arsenal[0]["source_season"], "workload": workload, "opponent_k_rate": opponent_k_rate, "lineup_confirmed": lineup_confirmed, "batters": hitter_rows}
+        home = profile(home_pitcher, away_batters, bool(away_lineup))
+        away = profile(away_pitcher, home_batters, bool(home_lineup))
     if not home and not away:
         return {"ready": False, "message": "Neither probable starter has a saved MLB pitch profile yet. Rerun the matchup sync after both starters have appeared in an MLB game."}
-    home = home or {"pitcher": home_pitcher["fullName"], "arsenal": [], "arsenal_season": "—", "batters": []}
-    away = away or {"pitcher": away_pitcher["fullName"], "arsenal": [], "arsenal_season": "—", "batters": []}
+    home = home or {"pitcher": home_pitcher["fullName"], "arsenal": [], "arsenal_season": "—", "lineup_confirmed": bool(away_lineup), "batters": []}
+    away = away or {"pitcher": away_pitcher["fullName"], "arsenal": [], "arsenal_season": "—", "lineup_confirmed": bool(home_lineup), "batters": []}
     sync_note = f"Profile updated {latest_sync['synced_at'][:16].replace('T', ' ')} UTC from {latest_sync['feed_count']} completed games." if latest_sync else "Saved MLB Gameday pitch profiles matched by probable starter."
-    return {"ready": True, "lineup_note": f"{sync_note} Active non-pitchers are shown until official lineups post.", "context": context, "home": home, "away": away}
+    confirmed = []
+    if away_lineup:
+        confirmed.append("away")
+    if home_lineup:
+        confirmed.append("home")
+    lineup_note = f"{sync_note} "
+    if len(confirmed) == 2:
+        lineup_note += "Both official MLB starting lineups are posted; hitters are shown in batting order."
+    elif confirmed:
+        lineup_note += f"The {confirmed[0]} official MLB starting lineup is posted; the other side remains an active-roster view."
+    else:
+        lineup_note += "Official starting lineups are not posted yet, so active non-pitchers are shown and sorted by arsenal fit."
+    return {"ready": True, "lineup_note": lineup_note, "context": context, "home": home, "away": away}
 
 def games_for_today():
-    date = datetime.now(timezone.utc).strftime("%Y%m%d")
+    # MLB's schedule should follow the user/server calendar day, not UTC.
+    # This keeps late-evening East Coast games on today's slate after midnight UTC.
+    date = datetime.now().astimezone().strftime("%Y%m%d")
     scoreboard = get_espn_json("/scoreboard", {"dates": date, "limit": 100})
     mlb_schedule = get_json("/schedule", {"sportId": 1, "date": f"{date[:4]}-{date[4:6]}-{date[6:]}", "hydrate": "probablePitcher"})
     mlb_by_teams = {}
@@ -151,13 +339,20 @@ def games_for_today():
         weather = competition.get("weather", {})
         games.append({
             "gamePk": mlb_game.get("gamePk"), "venue": competition.get("venue", {}).get("fullName", "Venue TBD"),
-            "start": event.get("date", "").replace("T", " ").replace("Z", " UTC"),
+            "start": local_game_time(event.get("date")),
+            "start_time": event.get("date", ""),
             "status": event.get("status", {}).get("type", {}).get("detail", "Scheduled"),
+            "espn_odds": competition.get("odds", []),
             "away": {"name": away_team.get("displayName", "Away"), "abbr": away_team.get("abbreviation", "AWY"), "pitcher": mlb_teams.get("away", {}).get("probablePitcher", {}).get("fullName", "TBD")},
             "home": {"name": home_team.get("displayName", "Home"), "abbr": home_team.get("abbreviation", "HME"), "pitcher": mlb_teams.get("home", {}).get("probablePitcher", {}).get("fullName", "TBD")},
             "weather": {"condition": weather.get("displayValue"), "temp": weather.get("temperature"), "wind": weather.get("wind")},
         })
-    return {"date": f"{date[:4]}-{date[4:6]}-{date[6:]}", "games": games}
+    slate_date = f"{date[:4]}-{date[4:6]}-{date[6:]}"
+    odds_by_game, odds_message = odds_for_slate(games, slate_date)
+    for game in games:
+        game["odds"] = odds_by_game.get(game["gamePk"])
+        game.pop("espn_odds", None)
+    return {"date": slate_date, "odds_message": odds_message, "games": games}
 
 class Handler(SimpleHTTPRequestHandler):
     def do_GET(self):
