@@ -1,0 +1,4 @@
+captured_at,provider,platform_type,game_pk,player_id,player_name,prop_type,line,over_price,under_price,payout_json,is_closing
+2026-08-12T18:00:00-04:00,Example Book,sportsbook,823994,123456,Example Pitcher,pitcher_strikeouts,5.5,-110,-110,,false
+2026-08-12T18:05:00-04:00,Example Pickem,pickem,823994,123456,Example Pitcher,pitcher_strikeouts,5.5,,,"{""entry_size"":2,""payout_multiple"":3}",false
+

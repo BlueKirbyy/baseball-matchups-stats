@@ -1,0 +1,44 @@
+{
+  "gameData": {
+    "game": {"pk": 42},
+    "datetime": {"officialDate": "2026-04-10"},
+    "teams": {"away": {"id": 10}, "home": {"id": 20}}
+  },
+  "liveData": {
+    "plays": {
+      "allPlays": [
+        {
+          "about": {"halfInning": "top"},
+          "matchup": {
+            "pitcher": {"id": 200, "fullName": "Home Starter"},
+            "batter": {"id": 100, "fullName": "Away Batter"},
+            "pitchHand": {"code": "R"}, "batSide": {"code": "L"}
+          },
+          "result": {"eventType": "strikeout"},
+          "playEvents": [{"isPitch": true}, {"isPitch": true}, {"isPitch": true}]
+        },
+        {
+          "about": {"halfInning": "bottom"},
+          "matchup": {
+            "pitcher": {"id": 300, "fullName": "Away Starter"},
+            "batter": {"id": 400, "fullName": "Home Batter"},
+            "pitchHand": {"code": "L"}, "batSide": {"code": "R"}
+          },
+          "result": {"eventType": "double"},
+          "playEvents": [{"isPitch": true}]
+        },
+        {
+          "about": {"halfInning": "top"},
+          "matchup": {
+            "pitcher": {"id": 201, "fullName": "Home Reliever"},
+            "batter": {"id": 101, "fullName": "Away Bench"},
+            "pitchHand": {"code": "R"}, "batSide": {"code": "R"}
+          },
+          "result": {"eventType": "field_out"},
+          "playEvents": [{"isPitch": true}, {"isPitch": true}]
+        }
+      ]
+    }
+  }
+}
+
