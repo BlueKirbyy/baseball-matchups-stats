@@ -7,10 +7,16 @@ from urllib.parse import urlencode, urlsplit
 from urllib.request import urlopen
 from analytics_store import connect, initialize
 from market_data import normalize_row
-from modeling import hitter_arsenal_summary, hitter_k_risk, hitter_market_context, hitter_pitch_summary, pitcher_k_projection
+from modeling import (
+    blend_full_game_hitter_matchup, hitter_arsenal_summary, hitter_k_risk,
+    hitter_market_context, hitter_pitch_summary, pitcher_k_projection,
+)
 from prediction_store import (
-    add_market_snapshot, latest_markets, record_game, record_pregame_snapshot,
-    is_before_start, save_prediction, utc_now,
+    add_market_snapshot, add_workload_override, latest_bullpen_snapshot,
+    latest_markets, latest_workload_override,
+    record_game, record_pregame_snapshot,
+    ensure_pregame_prediction, is_before_start, pending_prediction_game_pks,
+    prediction_tracking_summary, save_prediction, settle_game_predictions, utc_now,
 )
 
 PORT = 8000
@@ -18,6 +24,7 @@ MLB = "https://statsapi.mlb.com/api/v1"
 MLB_GAME_FEED = "https://statsapi.mlb.com/api/v1.1"
 ESPN = "https://site.api.espn.com/apis/site/v2/sports/baseball/mlb"
 ODDS_CACHE = {"key": None, "checked_at": 0, "by_game": {}, "message": None}
+SETTLEMENT_CACHE = {"checked_at": 0.0, "settled": 0}
 
 def get_json(path, query=None):
     url = MLB + path + ("?" + urlencode(query) if query else "")
@@ -28,6 +35,49 @@ def get_game_feed(game_pk):
     """The live game feed is on the separately versioned v1.1 MLB endpoint."""
     with urlopen(f"{MLB_GAME_FEED}/game/{game_pk}/feed/live", timeout=20) as response:
         return json.loads(response.read())
+
+
+def final_pitching_lines(feed):
+    """Extract official pitcher results used to settle immutable forecasts."""
+    lines = {}
+    teams = feed.get("liveData", {}).get("boxscore", {}).get("teams", {})
+    for side in ("away", "home"):
+        players = (teams.get(side) or {}).get("players", {})
+        for player in players.values() if isinstance(players, dict) else []:
+            person = player.get("person", {}) if isinstance(player, dict) else {}
+            stats = ((player.get("stats") or {}).get("pitching") or {}) if isinstance(player, dict) else {}
+            player_id = person.get("id")
+            if not player_id or not stats or stats.get("strikeOuts") is None:
+                continue
+            lines[int(player_id)] = {
+                "strikeouts": number(stats.get("strikeOuts")),
+                "batters_faced": number(stats.get("battersFaced")),
+                "pitches": number(stats.get("numberOfPitches")),
+                "outs": number(stats.get("outs")),
+                "runs": number(stats.get("runs")),
+                "earned_runs": number(stats.get("earnedRuns")),
+                "hits": number(stats.get("hits")),
+                "walks": number(stats.get("baseOnBalls")),
+            }
+    return lines
+
+
+def settle_finished_predictions(force=False):
+    """Best-effort free settlement from MLB; never blocks the board on failure."""
+    now = time.time()
+    if not force and now - SETTLEMENT_CACHE["checked_at"] < 5 * 60:
+        return SETTLEMENT_CACHE["settled"]
+    settled = 0
+    for game_pk in pending_prediction_game_pks():
+        try:
+            feed = get_game_feed(game_pk)
+            state = feed.get("gameData", {}).get("status", {}).get("abstractGameState")
+            if state == "Final":
+                settled += len(settle_game_predictions(game_pk, final_pitching_lines(feed)))
+        except Exception:
+            continue
+    SETTLEMENT_CACHE.update({"checked_at": now, "settled": settled})
+    return settled
 
 def get_espn_json(path, query=None):
     url = ESPN + path + ("?" + urlencode(query) if query else "")
@@ -335,6 +385,202 @@ def game_context(feed, db, season):
             umpire = {"name": home_plate.get("fullName", "Home plate umpire"), "status": f"Limited cached sample ({games} games); no tendency label yet."}
     return {"park": {"name": venue.get("name", "Park TBD"), "roof": roof, "turf": field.get("turfType", "Unknown"), "dimensions": dimensions or "Dimensions unavailable", "read": "; ".join(geometry) or "Standard geometry context"}, "weather": {"condition": weather.get("condition", "Weather pending"), "temp": temperature, "wind": wind or "Wind pending", "read": "; ".join(weather_read) or "Weather impact pending"}, "umpire": umpire}
 
+
+def saved_pitcher_arsenal(db, player_id, season):
+    arsenal = [dict(row) for row in db.execute(
+        """SELECT season AS source_season, pitch_name AS pitch, pitch_code AS code,
+                  usage, velo, zones, swings, whiffs, chases, strikeouts
+           FROM gameday_pitcher_arsenal
+           WHERE player_id=? AND season=(
+             SELECT MAX(season) FROM gameday_pitcher_arsenal
+             WHERE player_id=? AND season<=?
+           ) ORDER BY pitches DESC""",
+        (player_id, player_id, season),
+    )]
+    for pitch in arsenal:
+        try:
+            pitch["zones"] = json.loads(pitch["zones"])
+        except (TypeError, json.JSONDecodeError):
+            pitch["zones"] = []
+    return arsenal
+
+
+def pitcher_appearance_history(db, player_id, official_date):
+    return [dict(row) for row in db.execute(
+        """SELECT observation.game_pk, observation.game_date, observation.is_start,
+                  COALESCE(result.batters_faced, observation.batters_faced) AS batters_faced,
+                  COALESCE(result.strikeouts, observation.strikeouts) AS strikeouts,
+                  COALESCE(result.outs, observation.outs) AS outs,
+                  COALESCE(result.pitches, observation.pitches) AS pitches,
+                  observation.throws,
+                  COALESCE(result.walks_allowed, observation.walks_allowed) AS walks_allowed,
+                  COALESCE(result.hits_allowed, observation.hits_allowed) AS hits_allowed,
+                  COALESCE(result.runs_allowed, observation.runs_allowed) AS runs_allowed,
+                  COALESCE(result.earned_runs, observation.earned_runs) AS earned_runs
+           FROM player_game_observations observation
+           LEFT JOIN pitcher_game_results result
+             ON result.game_pk=observation.game_pk AND result.player_id=observation.player_id
+           WHERE observation.player_id=? AND observation.role='pitcher'
+             AND (? IS NULL OR observation.game_date<?)
+           ORDER BY observation.game_date, observation.game_pk""",
+        (player_id, official_date, official_date),
+    )]
+
+
+def hitter_k_profile_for_hand(db, season, batter_id, pitcher_throws):
+    hand_row = None
+    if pitcher_throws:
+        hand_row = db.execute(
+            """SELECT SUM(pa) AS pa, SUM(strikeouts) AS strikeouts
+               FROM gameday_batter_pitch_context
+               WHERE season=? AND player_id=? AND pitcher_throws=?""",
+            (season, batter_id, pitcher_throws),
+        ).fetchone()
+    if hand_row and (hand_row["pa"] or 0):
+        row, source = hand_row, f"vs {pitcher_throws}HP"
+    else:
+        row = db.execute(
+            """SELECT SUM(pa) AS pa, SUM(strikeouts) AS strikeouts
+               FROM gameday_batter_pitch_velocity
+               WHERE season=? AND player_id=?""",
+            (season, batter_id),
+        ).fetchone()
+        source = "all pitchers fallback"
+    pa = int(row["pa"] or 0) if row else 0
+    strikeouts = int(row["strikeouts"] or 0) if row else 0
+    profile = {
+        "pa": pa, "strikeouts": strikeouts,
+        "rate": round(strikeouts / pa, 3) if pa else None,
+        "source": source,
+    }
+    profile["research"] = hitter_k_risk(profile)
+    return profile
+
+
+def hitter_profile_for_pitcher(db, season, batter, pitcher_id, arsenal,
+                               pitcher_throws, market_context):
+    """Build the same pitch/velocity/context hitter evidence for any pitcher."""
+    batter_id = batter["id"]
+    codes = [pitch["code"] for pitch in arsenal[:5]]
+    source_season = arsenal[0]["source_season"] if arsenal else season
+    pitcher_context_by_pitch = {}
+    for row in db.execute(
+        """SELECT pitch_code, count_bucket, zone, pitches
+           FROM gameday_pitcher_arsenal_context
+           WHERE season=? AND player_id=?""",
+        (source_season, pitcher_id),
+    ):
+        pitcher_context_by_pitch.setdefault(row["pitch_code"], []).append(row)
+
+    # The caller normally supplies the pitcher id separately on the temporary
+    # batter object. Keeping it out of the public response avoids ambiguity.
+    def context_for(pitch, base_row, velocity_range):
+        if not pitcher_throws or not base_row or not pitcher_context_by_pitch.get(pitch["code"]):
+            return None
+        center = round(float(pitch["velo"] or 0))
+        if velocity_range == "±2 mph":
+            velocity_clause, velocity_values = "velo_bucket BETWEEN ? AND ?", (center - 2, center + 2)
+        else:
+            velocity_clause, velocity_values = "1=1", ()
+        rows = db.execute(
+            f"""SELECT count_bucket, zone, SUM(pa) AS pa, SUM(at_bats) AS at_bats,
+                       SUM(hits) AS hits, SUM(total_bases) AS total_bases
+                FROM gameday_batter_pitch_context
+                WHERE season=? AND player_id=? AND pitch_code=?
+                  AND pitcher_throws=? AND {velocity_clause}
+                GROUP BY count_bucket, zone""",
+            (season, batter_id, pitch["code"], pitcher_throws, *velocity_values),
+        ).fetchall()
+        context = hitter_context_metrics(base_row, rows, pitcher_context_by_pitch[pitch["code"]])
+        if context:
+            context["pitcher_throws"] = pitcher_throws
+            context["range"] = velocity_range
+        return context
+
+    season_row = db.execute(
+        "SELECT pa, avg, hr FROM gameday_batter_season WHERE season=? AND player_id=?",
+        (season, batter_id),
+    ).fetchone()
+    discipline_row = db.execute(
+        """SELECT plate_appearances, pitches_seen, walks, hit_by_pitch,
+                  hits, total_bases, outs
+           FROM gameday_batter_discipline WHERE season=? AND player_id=?""",
+        (season, batter_id),
+    ).fetchone()
+    pitch_rows = db.execute(
+        f"""SELECT pitch_code, pa, avg, hr, zones FROM gameday_batter_pitch
+            WHERE season=? AND player_id=? AND pitch_code IN ({','.join('?' for _ in codes)})""",
+        (season, batter_id, *codes),
+    ).fetchall() if codes else []
+    exact_rows = {row["pitch_code"]: row for row in pitch_rows}
+    quality_rows = db.execute(
+        f"""SELECT pitch_code, pitches, swings, whiffs, chase_swings,
+                   batted_balls, hard_hits, barrel_proxy, strikeouts
+            FROM gameday_batter_pitch_quality
+            WHERE season=? AND player_id=? AND pitch_code IN ({','.join('?' for _ in codes)})""",
+        (season, batter_id, *codes),
+    ).fetchall() if codes else []
+    quality_by_pitch = {row["pitch_code"]: dict(row) for row in quality_rows}
+    by_pitch = {}
+    for pitch in arsenal[:5]:
+        center = round(float(pitch["velo"] or 0))
+        velocity_row = db.execute(
+            """SELECT SUM(pa) AS pa, SUM(at_bats) AS at_bats, SUM(hits) AS hits,
+                      SUM(hr) AS hr, SUM(strikeouts) AS strikeouts, SUM(outs) AS outs,
+                      SUM(doubles) AS doubles, SUM(triples) AS triples,
+                      SUM(total_bases) AS total_bases
+               FROM gameday_batter_pitch_velocity
+               WHERE season=? AND player_id=? AND pitch_code=?
+                 AND velo_bucket BETWEEN ? AND ?""",
+            (season, batter_id, pitch["code"], center - 2, center + 2),
+        ).fetchone()
+        if velocity_row and (velocity_row["pa"] or 0) >= 3 and (velocity_row["at_bats"] or 0):
+            velocity_range = "±2 mph"
+            by_pitch[pitch["code"]] = {
+                "pa": velocity_row["pa"],
+                "avg": f"{velocity_row['hits'] / velocity_row['at_bats']:.3f}",
+                "hr": velocity_row["hr"], "strikeouts": velocity_row["strikeouts"],
+                "outs": velocity_row["outs"], "advanced": hitter_power_metrics(velocity_row),
+                "context": context_for(pitch, velocity_row, velocity_range),
+                "quality": quality_by_pitch.get(pitch["code"]), "range": velocity_range,
+            }
+        elif pitch["code"] in exact_rows:
+            row = exact_rows[pitch["code"]]
+            outcome_row = db.execute(
+                """SELECT SUM(pa) AS pa, SUM(at_bats) AS at_bats, SUM(hits) AS hits,
+                          SUM(hr) AS hr, SUM(strikeouts) AS strikeouts, SUM(outs) AS outs,
+                          SUM(doubles) AS doubles, SUM(triples) AS triples,
+                          SUM(total_bases) AS total_bases
+                   FROM gameday_batter_pitch_velocity
+                   WHERE season=? AND player_id=? AND pitch_code=?""",
+                (season, batter_id, pitch["code"]),
+            ).fetchone()
+            velocity_range = "all velo"
+            by_pitch[pitch["code"]] = {
+                "pa": row["pa"], "avg": row["avg"], "hr": row["hr"],
+                "strikeouts": outcome_row["strikeouts"] if outcome_row else None,
+                "outs": outcome_row["outs"] if outcome_row else None,
+                "advanced": hitter_power_metrics(outcome_row),
+                "context": context_for(pitch, outcome_row, velocity_range),
+                "quality": quality_by_pitch.get(pitch["code"]), "range": velocity_range,
+            }
+    public_batter = dict(batter)
+    hitter = {
+        "id": batter_id, "name": batter["fullName"],
+        "lineup_order": batter.get("lineup_order"), "bat_side": batter.get("bat_side"),
+        "season": dict(season_row) if season_row else {"pa": "—", "avg": "—", "hr": "—"},
+        "discipline": dict(discipline_row) if discipline_row else {},
+        "vs_pitches": by_pitch,
+        "k_profile": hitter_k_profile_for_hand(db, season, batter_id, pitcher_throws),
+    }
+    for stat in by_pitch.values():
+        stat["research"] = hitter_pitch_summary(stat)
+    hitter["arsenal_research"] = hitter_arsenal_summary(
+        hitter, arsenal[:5], market_context=market_context,
+    )
+    hitter.update({key: value for key, value in public_batter.items() if key not in hitter})
+    return hitter
+
 def matchup_research(game_pk):
     feed = get_game_feed(game_pk)
     data = feed.get("gameData", {})
@@ -366,111 +612,28 @@ def matchup_research(game_pk):
                 data_freshness_seconds = max(0.0, (datetime.now(timezone.utc) - synced_at).total_seconds())
             except (TypeError, ValueError):
                 pass
-        def profile(pitcher, hitters, lineup_confirmed, batting_team):
-            arsenal = [dict(row) for row in db.execute("SELECT season AS source_season, pitch_name AS pitch, pitch_code AS code, usage, velo, zones FROM gameday_pitcher_arsenal WHERE player_id=? AND season=(SELECT MAX(season) FROM gameday_pitcher_arsenal WHERE player_id=? AND season<=?) ORDER BY pitches DESC", (pitcher["id"], pitcher["id"], season))]
+        def profile(pitcher, hitters, lineup_confirmed, batting_team, pitching_team):
+            arsenal = saved_pitcher_arsenal(db, pitcher["id"], season)
             if not arsenal:
                 return None
             workload_row = db.execute("SELECT appearances, batters_faced, strikeouts, outs, pitches, recent_appearances, recent_batters_faced, recent_strikeouts, recent_outs, recent_pitches FROM gameday_pitcher_workload WHERE season=? AND player_id=?", (season, pitcher["id"])).fetchone()
             workload = dict(workload_row) if workload_row else None
-            appearance_history = [dict(row) for row in db.execute(
-                """SELECT game_pk, game_date, is_start, batters_faced, strikeouts, outs, pitches, throws
-                   FROM player_game_observations
-                   WHERE player_id=? AND role='pitcher' AND (? IS NULL OR game_date<?)
-                   ORDER BY game_date, game_pk""",
-                (pitcher["id"], official_date, official_date),
-            )]
-            for pitch in arsenal:
-                pitch["zones"] = json.loads(pitch["zones"])
-            codes = [pitch["code"] for pitch in arsenal[:5]]
-            source_season = arsenal[0]["source_season"]
+            appearance_history = pitcher_appearance_history(db, pitcher["id"], official_date)
             pitcher_throws = next((row.get("throws") for row in reversed(appearance_history) if row.get("throws")), None)
-            pitcher_context_by_pitch = {}
-            for row in db.execute("SELECT pitch_code, count_bucket, zone, pitches FROM gameday_pitcher_arsenal_context WHERE season=? AND player_id=?", (source_season, pitcher["id"])):
-                pitcher_context_by_pitch.setdefault(row["pitch_code"], []).append(row)
-
-            def context_for(batter_id, pitch, base_row, velocity_range):
-                if not pitcher_throws or not base_row or not pitcher_context_by_pitch.get(pitch["code"]):
-                    return None
-                center = round(float(pitch["velo"] or 0))
-                if velocity_range == "±2 mph":
-                    velocity_clause, velocity_values = "velo_bucket BETWEEN ? AND ?", (center - 2, center + 2)
-                else:
-                    velocity_clause, velocity_values = "1=1", ()
-                rows = db.execute(
-                    f"""SELECT count_bucket, zone, SUM(pa) AS pa, SUM(at_bats) AS at_bats,
-                               SUM(hits) AS hits, SUM(total_bases) AS total_bases
-                        FROM gameday_batter_pitch_context
-                        WHERE season=? AND player_id=? AND pitch_code=? AND pitcher_throws=? AND {velocity_clause}
-                        GROUP BY count_bucket, zone""",
-                    (season, batter_id, pitch["code"], pitcher_throws, *velocity_values),
-                ).fetchall()
-                context = hitter_context_metrics(base_row, rows, pitcher_context_by_pitch[pitch["code"]])
-                if context:
-                    context["pitcher_throws"] = pitcher_throws
-                    context["range"] = velocity_range
-                return context
-
-            def hitter_k_profile(batter_id):
-                """Use broad final-pitch PA history for stable lineup K risk."""
-                hand_row = None
-                if pitcher_throws:
-                    hand_row = db.execute(
-                        """SELECT SUM(pa) AS pa, SUM(strikeouts) AS strikeouts
-                           FROM gameday_batter_pitch_context
-                           WHERE season=? AND player_id=? AND pitcher_throws=?""",
-                        (season, batter_id, pitcher_throws),
-                    ).fetchone()
-                if hand_row and (hand_row["pa"] or 0):
-                    row, source = hand_row, f"vs {pitcher_throws}HP"
-                else:
-                    row = db.execute(
-                        """SELECT SUM(pa) AS pa, SUM(strikeouts) AS strikeouts
-                           FROM gameday_batter_pitch_velocity
-                           WHERE season=? AND player_id=?""",
-                        (season, batter_id),
-                    ).fetchone()
-                    source = "all pitchers fallback"
-                pa = int(row["pa"] or 0) if row else 0
-                strikeouts = int(row["strikeouts"] or 0) if row else 0
-                return {
-                    "pa": pa,
-                    "strikeouts": strikeouts,
-                    "rate": round(strikeouts / pa, 3) if pa else None,
-                    "source": source,
-                }
-
-            hitter_rows = []
             market_context = hitter_market_context(game_market, batting_team)
-            for batter in hitters:
-                season_row = db.execute("SELECT pa, avg, hr FROM gameday_batter_season WHERE season=? AND player_id=?", (season, batter["id"])).fetchone()
-                pitch_rows = db.execute(f"SELECT pitch_code, pa, avg, hr, zones FROM gameday_batter_pitch WHERE season=? AND player_id=? AND pitch_code IN ({','.join('?' for _ in codes)})", (season, batter["id"], *codes)).fetchall() if codes else []
-                exact_rows = {row["pitch_code"]: row for row in pitch_rows}
-                quality_rows = db.execute(f"SELECT pitch_code, pitches, swings, whiffs, chase_swings, batted_balls, hard_hits, barrel_proxy, strikeouts FROM gameday_batter_pitch_quality WHERE season=? AND player_id=? AND pitch_code IN ({','.join('?' for _ in codes)})", (season, batter["id"], *codes)).fetchall() if codes else []
-                quality_by_pitch = {row["pitch_code"]: dict(row) for row in quality_rows}
-                by_pitch = {}
-                for pitch in arsenal[:5]:
-                    center = round(float(pitch["velo"] or 0))
-                    velocity_row = db.execute("SELECT SUM(pa) AS pa, SUM(at_bats) AS at_bats, SUM(hits) AS hits, SUM(hr) AS hr, SUM(strikeouts) AS strikeouts, SUM(outs) AS outs, SUM(doubles) AS doubles, SUM(triples) AS triples, SUM(total_bases) AS total_bases FROM gameday_batter_pitch_velocity WHERE season=? AND player_id=? AND pitch_code=? AND velo_bucket BETWEEN ? AND ?", (season, batter["id"], pitch["code"], center - 2, center + 2)).fetchone()
-                    if velocity_row and (velocity_row["pa"] or 0) >= 3 and (velocity_row["at_bats"] or 0):
-                        velocity_range = "±2 mph"
-                        by_pitch[pitch["code"]] = {"pa": velocity_row["pa"], "avg": f"{velocity_row['hits'] / velocity_row['at_bats']:.3f}", "hr": velocity_row["hr"], "strikeouts": velocity_row["strikeouts"], "outs": velocity_row["outs"], "advanced": hitter_power_metrics(velocity_row), "context": context_for(batter["id"], pitch, velocity_row, velocity_range), "quality": quality_by_pitch.get(pitch["code"]), "range": velocity_range}
-                    elif pitch["code"] in exact_rows:
-                        row = exact_rows[pitch["code"]]
-                        outcome_row = db.execute("SELECT SUM(pa) AS pa, SUM(at_bats) AS at_bats, SUM(hits) AS hits, SUM(hr) AS hr, SUM(strikeouts) AS strikeouts, SUM(outs) AS outs, SUM(doubles) AS doubles, SUM(triples) AS triples, SUM(total_bases) AS total_bases FROM gameday_batter_pitch_velocity WHERE season=? AND player_id=? AND pitch_code=?", (season, batter["id"], pitch["code"])).fetchone()
-                        velocity_range = "all velo"
-                        by_pitch[pitch["code"]] = {"pa": row["pa"], "avg": row["avg"], "hr": row["hr"], "strikeouts": outcome_row["strikeouts"] if outcome_row else None, "outs": outcome_row["outs"] if outcome_row else None, "advanced": hitter_power_metrics(outcome_row), "context": context_for(batter["id"], pitch, outcome_row, velocity_range), "quality": quality_by_pitch.get(pitch["code"]), "range": velocity_range}
-                k_profile = hitter_k_profile(batter["id"])
-                k_profile["research"] = hitter_k_risk(k_profile)
-                hitter = {"id": batter["id"], "name": batter["fullName"], "lineup_order": batter.get("lineup_order"), "bat_side": batter.get("bat_side"), "season": dict(season_row) if season_row else {"pa": "—", "avg": "—", "hr": "—"}, "vs_pitches": by_pitch, "k_profile": k_profile}
-                for stat in by_pitch.values():
-                    stat["research"] = hitter_pitch_summary(stat)
-                hitter["arsenal_research"] = hitter_arsenal_summary(hitter, arsenal[:5], market_context=market_context)
-                hitter_rows.append(hitter)
+            hitter_rows = [
+                hitter_profile_for_pitcher(
+                    db, season, batter, pitcher["id"], arsenal,
+                    pitcher_throws, market_context,
+                )
+                for batter in hitters
+            ]
             batter_ids = [batter["id"] for batter in hitters]
             placeholders = ",".join("?" for _ in batter_ids)
             opponent_row = db.execute(f"SELECT SUM(pa) AS pa, SUM(strikeouts) AS strikeouts FROM gameday_batter_pitch_velocity WHERE season=? AND player_id IN ({placeholders})", (season, *batter_ids)).fetchone() if batter_ids else None
             opponent_k_rate = (opponent_row["strikeouts"] / opponent_row["pa"]) if opponent_row and opponent_row["pa"] and opponent_row["strikeouts"] is not None else None
             side = {"pitcher_id": pitcher["id"], "pitcher": pitcher["fullName"], "pitcher_throws": pitcher_throws, "arsenal": arsenal, "arsenal_season": arsenal[0]["source_season"], "workload": workload, "appearance_history": appearance_history, "opponent_k_rate": opponent_k_rate, "lineup_confirmed": lineup_confirmed, "data_freshness_seconds": data_freshness_seconds, "batting_team": batting_team, "market_context": market_context, "batters": hitter_rows}
+            side["workload_override"] = latest_workload_override(game_pk, pitcher["id"], captured_at)
             markets = latest_markets(game_pk, player_id=pitcher["id"], player_name=pitcher["fullName"], as_of=captured_at)
             market_predictions = [pitcher_k_projection(side, market, captured_at, scheduled_start) for market in markets]
             priced = [item for item in market_predictions if item.get("market") and item["market"].get("expected_value_over") is not None]
@@ -482,13 +645,116 @@ def matchup_research(game_pk):
                 ),
             ) if market_predictions else pitcher_k_projection(side, None, captured_at, scheduled_start)
             side["market_projections"] = market_predictions
+
+            snapshots = latest_bullpen_snapshot(
+                game_pk, pitching_team["id"], captured_at,
+            )
+            relievers = []
+            for snapshot in snapshots:
+                reliever_id = snapshot["player_id"]
+                reliever_arsenal = saved_pitcher_arsenal(db, reliever_id, season)
+                reliever_hand = snapshot.get("throws")
+                fits = {}
+                if reliever_arsenal:
+                    for batter in hitters:
+                        reliever_hitter = hitter_profile_for_pitcher(
+                            db, season, batter, reliever_id, reliever_arsenal,
+                            reliever_hand, market_context,
+                        )
+                        fits[batter["id"]] = {
+                            "summary": reliever_hitter["arsenal_research"],
+                            "k_profile": reliever_hitter["k_profile"],
+                        }
+                relievers.append({
+                    **snapshot,
+                    "arsenal": reliever_arsenal,
+                    "fits": fits,
+                })
+            total_mix = sum(max(0.0, number(reliever.get("mix_weight")) or 0.0) for reliever in relievers)
+            for reliever in relievers:
+                reliever["mix_share"] = (
+                    (number(reliever.get("mix_weight")) or 0.0) / total_mix
+                    if total_mix else 0.0
+                )
+            projection = side.get("projection") or {}
+            expected_bf = projection.get("expected_batters_faced") or 22.0
+            bf_interval = projection.get("batters_faced_interval")
+            for hitter in hitter_rows:
+                bullpen_entries = []
+                for reliever in relievers:
+                    fit = reliever["fits"].get(hitter["id"], {})
+                    bullpen_entries.append({
+                        "player_id": reliever["player_id"],
+                        "name": reliever["player_name"],
+                        "weight": reliever.get("mix_weight", 0.0),
+                        "status": reliever.get("readiness_status"),
+                        "role": reliever.get("role"),
+                        "summary": fit.get("summary"),
+                        "k_profile": fit.get("k_profile"),
+                    })
+                hitter["full_game_research"] = blend_full_game_hitter_matchup(
+                    hitter, hitter["arsenal_research"], bullpen_entries,
+                    expected_bf, bf_interval, market_context,
+                )
+            public_relievers = []
+            for reliever in relievers:
+                hitter_fits = []
+                for hitter in hitter_rows:
+                    fit = reliever["fits"].get(hitter["id"], {})
+                    summary = fit.get("summary") or {}
+                    hitter_fits.append({
+                        "id": hitter["id"], "name": hitter["name"],
+                        "lineup_order": hitter.get("lineup_order"),
+                        "tier": summary.get("tier", "watchlist"),
+                        "tone": summary.get("tone", "neutral"),
+                        "expected_average": summary.get("expected_average"),
+                        "expected_slg": summary.get("expected_slg"),
+                        "expected_iso": summary.get("expected_iso"),
+                        "coverage": summary.get("coverage", 0.0),
+                        "effective_sample_size": summary.get("effective_sample_size", 0.0),
+                    })
+                public_relievers.append({
+                    key: value for key, value in reliever.items() if key != "fits"
+                } | {"hitter_fits": hitter_fits})
+            status_counts = {
+                status: sum(reliever.get("readiness_status") == status for reliever in relievers)
+                for status in ("fresh", "available", "limited", "unlikely", "unknown")
+            }
+            weighted_readiness = (
+                sum((number(reliever.get("readiness_score")) or 0.0) * reliever["mix_share"] for reliever in relievers)
+                if relievers else None
+            )
+            if weighted_readiness is None:
+                readiness_label = "Not synced"
+            elif weighted_readiness >= 75:
+                readiness_label = "Fresh"
+            elif weighted_readiness >= 50:
+                readiness_label = "Available"
+            else:
+                readiness_label = "Taxed"
+            side["bullpen"] = {
+                "team_id": pitching_team["id"], "team": pitching_team["name"],
+                "captured_at": snapshots[0]["captured_at"] if snapshots else None,
+                "readiness_score": weighted_readiness,
+                "readiness_label": readiness_label,
+                "status_counts": status_counts,
+                "modeled_mix": sum(reliever["mix_share"] for reliever in relievers if reliever["arsenal"]),
+                "relievers": public_relievers,
+                "message": None if snapshots else "No saved bullpen snapshot. Rerun python3 sync_statcast.py --all.",
+            }
             return side
-        home = profile(home_pitcher, away_batters, bool(away_lineup), teams["away"]["name"])
-        away = profile(away_pitcher, home_batters, bool(home_lineup), teams["home"]["name"])
+        home = profile(home_pitcher, away_batters, bool(away_lineup), teams["away"]["name"], teams["home"])
+        away = profile(away_pitcher, home_batters, bool(home_lineup), teams["home"]["name"], teams["away"])
     if not home and not away:
         return {"ready": False, "message": "Neither probable starter has a saved MLB pitch profile yet. Rerun the matchup sync after both starters have appeared in an MLB game."}
     home = home or {"pitcher_id": home_pitcher["id"], "pitcher": home_pitcher["fullName"], "arsenal": [], "arsenal_season": "—", "lineup_confirmed": bool(away_lineup), "batters": []}
     away = away or {"pitcher_id": away_pitcher["id"], "pitcher": away_pitcher["fullName"], "arsenal": [], "arsenal_season": "—", "lineup_confirmed": bool(home_lineup), "batters": []}
+    for side in (home, away):
+        projection = side.get("projection")
+        if projection:
+            side["prediction_record"] = ensure_pregame_prediction(
+                game_pk, projection, market=projection.get("market"),
+            )
     sync_note = f"Profile updated {latest_sync['synced_at'][:16].replace('T', ' ')} UTC from {latest_sync['feed_count']} completed games." if latest_sync else "Saved MLB Gameday pitch profiles matched by probable starter."
     confirmed = []
     if away_lineup:
@@ -502,11 +768,16 @@ def matchup_research(game_pk):
         lineup_note += f"The {confirmed[0]} official MLB starting lineup is posted; the other side remains an active-roster view."
     else:
         lineup_note += "Official starting lineups are not posted yet, so active non-pitchers are shown by evidence coverage."
-    return {"ready": True, "lineup_note": lineup_note, "context": context, "market": game_market, "home": home, "away": away}
+    return {
+        "ready": True, "lineup_note": lineup_note, "context": context,
+        "market": game_market, "tracking": prediction_tracking_summary(),
+        "home": home, "away": away,
+    }
 
 def games_for_today():
     # MLB's schedule should follow the user/server calendar day, not UTC.
     # This keeps late-evening East Coast games on today's slate after midnight UTC.
+    settle_finished_predictions()
     date = datetime.now().astimezone().strftime("%Y%m%d")
     scoreboard = get_espn_json("/scoreboard", {"dates": date, "limit": 100})
     mlb_schedule = get_json("/schedule", {"sportId": 1, "date": f"{date[:4]}-{date[4:6]}-{date[6:]}", "hydrate": "probablePitcher"})
@@ -578,11 +849,37 @@ class Handler(SimpleHTTPRequestHandler):
 
     def do_POST(self):
         try:
+            if self.path == "/api/workload-overrides":
+                payload = self._json_body()
+                required = ("game_pk", "player_id", "player_name", "pitch_limit", "captured_at")
+                missing = [field for field in required if payload.get(field) in (None, "")]
+                if missing:
+                    raise ValueError(f"Missing required fields: {', '.join(missing)}")
+                with connect() as db:
+                    game = db.execute("SELECT scheduled_start FROM games WHERE game_pk=?", (int(payload["game_pk"]),)).fetchone()
+                if game and game["scheduled_start"] and not is_before_start(payload["captured_at"], game["scheduled_start"]):
+                    raise ValueError("A pitch limit must be captured before scheduled first pitch")
+                identifier = add_workload_override({
+                    "captured_at": payload["captured_at"],
+                    "game_pk": int(payload["game_pk"]),
+                    "player_id": int(payload["player_id"]),
+                    "player_name": str(payload["player_name"]).strip(),
+                    "pitch_limit": float(payload["pitch_limit"]),
+                    "source": str(payload.get("source") or "manual").strip(),
+                    "note": str(payload.get("note") or "").strip() or None,
+                })
+                self._send_json(201, {"workload_override_id": identifier})
+                return
             if self.path == "/api/markets":
                 payload = self._json_body()
                 row = normalize_row(payload, "manual-api")
+                if row.get("game_pk"):
+                    with connect() as db:
+                        game = db.execute("SELECT scheduled_start FROM games WHERE game_pk=?", (row["game_pk"],)).fetchone()
+                    if game and game["scheduled_start"] and not is_before_start(row["captured_at"], game["scheduled_start"]):
+                        raise ValueError("A sportsbook line must be captured before scheduled first pitch")
                 identifier = add_market_snapshot(row)
-                self._send_json(201, {"market_snapshot_id": identifier})
+                self._send_json(201, {"market_snapshot_id": identifier, "market": row})
                 return
             if self.path == "/api/predictions":
                 payload = self._json_body()
@@ -609,6 +906,10 @@ class Handler(SimpleHTTPRequestHandler):
                 self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers(); self.wfile.write(body)
             except Exception:
                 self.send_error(502, "Could not reach the public MLB schedule service")
+            return
+        if request_path == "/api/model-status":
+            settle_finished_predictions()
+            self._send_json(200, prediction_tracking_summary())
             return
         if request_path.startswith("/api/matchups/") and request_path.endswith("/research"):
             try:

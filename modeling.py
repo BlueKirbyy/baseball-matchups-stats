@@ -6,11 +6,11 @@ is a research model until walk-forward results establish calibration and value.
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from math import exp, floor, isfinite, lgamma, log, sqrt
+from math import erf, exp, floor, isfinite, lgamma, log, sqrt
 from statistics import median
 
-MODEL_VERSION = "pitcher-k-eb-v2"
-FEATURE_VERSION = "gameday-features-v2"
+MODEL_VERSION = "pitcher-k-workload-v4"
+FEATURE_VERSION = "gameday-features-v4"
 LEAGUE_K_RATE = 0.225
 LEAGUE_BF_PER_START = 22.0
 LEAGUE_HITTER_AVERAGE = 0.245
@@ -26,6 +26,10 @@ HITTER_CONTACT_FAVORABLE_DELTA = 0.012
 HITTER_ARSENAL_MIN_COVERAGE = 0.35
 HITTER_ARSENAL_MIN_EFFECTIVE_PA = 10.0
 LEAGUE_GAME_TOTAL = 8.5
+LEAGUE_PITCHES_PER_PA = 3.9
+LEAGUE_ON_BASE_PROXY = 0.320
+LEAGUE_OUT_RATE = 0.675
+LEAGUE_TOTAL_BASES_PER_PA = 0.360
 
 
 def _number(value, default=None):
@@ -136,12 +140,145 @@ def distribution_summary(mean, line=None, kind="negative_binomial", dispersion=1
     return result
 
 
+def beta_binomial_pmf(k, trials, alpha, beta):
+    """Beta-binomial PMF used to separate K-rate from workload uncertainty."""
+    if k < 0 or k > trials or alpha <= 0 or beta <= 0:
+        return 0.0
+    return exp(
+        lgamma(trials + 1) - lgamma(k + 1) - lgamma(trials - k + 1)
+        + lgamma(k + alpha) + lgamma(trials - k + beta) - lgamma(trials + alpha + beta)
+        + lgamma(alpha + beta) - lgamma(alpha) - lgamma(beta)
+    )
+
+
+def workload_k_distribution(k_rate, expected_bf, bf_low, bf_high, line=None, rate_strength=120.0):
+    """Mix K outcomes over a distribution of possible starter workloads."""
+    spread = max(2.0, (max(expected_bf, bf_high) - min(expected_bf, bf_low)) / 2.56)
+    bf_values = list(range(8, 37))
+    bf_weights = [exp(-0.5 * ((value - expected_bf) / spread) ** 2) for value in bf_values]
+    weight_total = sum(bf_weights) or 1.0
+    alpha = clamp(k_rate, .01, .99) * max(20.0, rate_strength)
+    beta = (1.0 - clamp(k_rate, .01, .99)) * max(20.0, rate_strength)
+    probabilities = [0.0] * 37
+    for batters_faced, weight in zip(bf_values, bf_weights):
+        normalized_weight = weight / weight_total
+        for strikeouts in range(batters_faced + 1):
+            probabilities[strikeouts] += normalized_weight * beta_binomial_pmf(
+                strikeouts, batters_faced, alpha, beta,
+            )
+    total = sum(probabilities) or 1.0
+    probabilities = [value / total for value in probabilities]
+
+    def quantile(target):
+        cumulative = 0.0
+        for value, probability in enumerate(probabilities):
+            cumulative += probability
+            if cumulative >= target:
+                return value
+        return len(probabilities) - 1
+
+    result = {
+        "distribution": "workload_beta_binomial",
+        "median": quantile(.5),
+        "interval_low": quantile(.1),
+        "interval_high": quantile(.9),
+        "milestones": {
+            str(target): sum(probabilities[target:]) for target in (4, 5, 6, 7, 8)
+        },
+    }
+    if line is not None:
+        line = float(line)
+        result["probability_over"] = sum(probabilities[floor(line) + 1:])
+        result["probability_under"] = sum(probabilities[:max(0, int(line) if line.is_integer() else floor(line) + 1)])
+        result["probability_push"] = probabilities[int(line)] if line.is_integer() and 0 <= int(line) < len(probabilities) else 0.0
+        decisive = result["probability_over"] + result["probability_under"]
+        if decisive:
+            result["fair_over_price"] = american_from_probability(result["probability_over"] / decisive)
+            result["fair_under_price"] = american_from_probability(result["probability_under"] / decisive)
+    return result
+
+
 def _lineup_weight(order):
     expected_pa = (4.75, 4.65, 4.55, 4.45, 4.35, 4.25, 4.15, 4.05, 3.95)
     try:
         return expected_pa[int(order) - 1]
     except (TypeError, ValueError, IndexError):
         return 4.2
+
+
+def bullpen_readiness(pitches_today=0, pitches_yesterday=0, pitches_two_days_ago=0,
+                      consecutive_days=0, three_day_pitches=None):
+    """Return a transparent, workload-only estimate of reliever readiness.
+
+    This is deliberately an estimate rather than an available/unavailable fact.
+    Recent pitches and consecutive-day use are observable; injuries, warm-up
+    activity, and manager intent are not. The score exists mainly to create
+    stable appearance-mix weights and an explainable UI status.
+    """
+    today = max(0.0, _number(pitches_today, 0.0))
+    yesterday = max(0.0, _number(pitches_yesterday, 0.0))
+    two_days = max(0.0, _number(pitches_two_days_ago, 0.0))
+    consecutive = max(0, int(_number(consecutive_days, 0.0)))
+    three_day = max(0.0, _number(three_day_pitches, today + yesterday + two_days))
+    score = 100.0 - 2.0 * today - 0.9 * yesterday - 0.35 * two_days
+    if consecutive >= 2:
+        score -= 12.0
+    if consecutive >= 3:
+        score -= 20.0
+    if yesterday >= 30:
+        score -= 10.0
+    if three_day >= 55:
+        score -= 10.0
+    score = clamp(score, 0.0, 100.0)
+    # "Fresh" is intentionally stricter than a high numeric score. A pitcher
+    # who already worked today, threw 20+ pitches yesterday, or is on a
+    # multi-day run may still be usable, but should not be presented as rested.
+    if score >= 75 and today == 0 and yesterday < 20 and consecutive < 2 and three_day < 40:
+        status, label = "fresh", "Likely fresh"
+    elif score >= 50:
+        status, label = "available", "Likely available"
+    elif score >= 25:
+        status, label = "limited", "Limited"
+    else:
+        status, label = "unlikely", "Unlikely"
+    reasons = []
+    if today:
+        reasons.append(f"{int(today)} pitches today")
+    if yesterday:
+        reasons.append(f"{int(yesterday)} pitches yesterday")
+    if consecutive >= 2:
+        reasons.append(f"worked {consecutive} straight days")
+    if not reasons:
+        reasons.append("no meaningful recent workload flag")
+    return {"score": round(score, 1), "status": status, "label": label, "reasons": reasons}
+
+
+def expected_starter_plate_appearances(lineup_order, expected_batters_faced,
+                                       batters_faced_interval=None):
+    """Estimate how many times one lineup slot will face the starter.
+
+    A hitter in slot ``i`` sees the starter when the starter reaches batter
+    numbers i, i+9, i+18, and so on. The BF interval supplies uncertainty
+    instead of treating a point estimate as a hard cutoff.
+    """
+    expected_bf = max(1.0, _number(expected_batters_faced, LEAGUE_BF_PER_START))
+    try:
+        order = int(lineup_order)
+        if not 1 <= order <= 9:
+            raise ValueError
+    except (TypeError, ValueError):
+        return round(_lineup_weight(None) * clamp(expected_bf / 38.0, 0.25, 0.80), 3)
+    low = high = None
+    if isinstance(batters_faced_interval, (list, tuple)) and len(batters_faced_interval) >= 2:
+        low = _number(batters_faced_interval[0])
+        high = _number(batters_faced_interval[1])
+    standard_deviation = max(2.2, ((high - low) / 2.563) if low is not None and high is not None and high > low else 4.0)
+    expected = 0.0
+    for turn in range(5):
+        threshold = order + 9 * turn
+        z_score = (threshold - 0.5 - expected_bf) / (standard_deviation * sqrt(2.0))
+        expected += 0.5 * (1.0 - erf(z_score))
+    return round(clamp(expected, 0.0, _lineup_weight(order)), 3)
 
 
 def pitch_mix_evidence(side, pitcher_rate):
@@ -246,8 +383,11 @@ def hitter_k_risk(profile):
     }
 
 
-def workload_read(side, expected_batters_faced, appearances, source):
+def workload_read(side, estimate):
     """Return a descriptive starter-leash read; it is not an extra K adjustment."""
+    expected_batters_faced = estimate["expected_batters_faced"]
+    appearances = estimate["appearances"]
+    source = estimate["source"]
     starts = [row for row in side.get("appearance_history", []) if row.get("is_start")]
     if starts:
         season_bf = sum(_number(row.get("batters_faced"), 0.0) for row in starts) / len(starts)
@@ -265,7 +405,7 @@ def workload_read(side, expected_batters_faced, appearances, source):
     delta = recent_bf - season_bf
     if appearances < 3:
         label, tone = "limited starter history", "neutral"
-    elif delta <= -2.0 or recent_pitches <= season_pitches - 12:
+    elif estimate["early_exit_risk"] >= .38 or delta <= -2.0 or recent_pitches <= season_pitches - 12:
         label, tone = "recently shortened", "bad"
     elif delta >= 2.0 and recent_pitches >= season_pitches + 8:
         label, tone = "recently extended", "good"
@@ -279,6 +419,12 @@ def workload_read(side, expected_batters_faced, appearances, source):
         "recent_batters_faced": recent_bf,
         "season_pitches": season_pitches,
         "recent_pitches": recent_pitches,
+        "expected_pitches": estimate["expected_pitches"],
+        "pitches_interval": estimate["pitches_interval"],
+        "expected_outs": estimate["expected_outs"],
+        "outs_interval": estimate["outs_interval"],
+        "early_exit_risk": estimate["early_exit_risk"],
+        "pitches_per_batter": estimate["pitches_per_batter"],
         "appearances": appearances,
         "source": source,
     }
@@ -287,13 +433,13 @@ def workload_read(side, expected_batters_faced, appearances, source):
 def k_opportunity_read(k_rate, expected_ks, lineup_rate, workload):
     """Classify K environment separately from evidence quality or a prop line."""
     if expected_ks >= 6.4 and k_rate >= .255 and workload["tone"] != "bad":
-        label, tone = "excellent K opportunity", "good"
+        label, tone = "high K environment", "good"
     elif expected_ks >= 5.4 and k_rate >= .225 and workload["tone"] != "bad":
-        label, tone = "good K opportunity", "good"
+        label, tone = "favorable K environment", "good"
     elif expected_ks <= 4.4 or k_rate <= .185 or workload["tone"] == "bad":
-        label, tone = "limited K opportunity", "bad"
+        label, tone = "limited K environment", "bad"
     else:
-        label, tone = "neutral K opportunity", "neutral"
+        label, tone = "neutral K environment", "neutral"
     return {
         "label": label,
         "tone": tone,
@@ -327,26 +473,277 @@ def k_data_grade(lineup_confirmed, appearances, lineup_evidence, pitch_evidence,
     return {"grade": grade, "blockers": blockers}
 
 
+def lineup_workload_context(side):
+    """Summarize opponent patience, traffic, power, and out conversion.
+
+    These are full-season Gameday outcomes for the listed hitters, shrunk to
+    league priors and weighted by batting order. Missing data remains neutral.
+    """
+    totals = {"ppa": 0.0, "on_base": 0.0, "out_rate": 0.0, "tb_per_pa": 0.0}
+    weight_total = coverage = effective_pa = 0.0
+    for batter in side.get("batters", []):
+        discipline = batter.get("discipline") or {}
+        pa = max(0.0, _number(discipline.get("plate_appearances"), 0.0))
+        pitches = max(0.0, _number(discipline.get("pitches_seen"), 0.0))
+        walks = max(0.0, _number(discipline.get("walks"), 0.0))
+        hbp = max(0.0, _number(discipline.get("hit_by_pitch"), 0.0))
+        hits = max(0.0, _number(discipline.get("hits"), 0.0))
+        outs = max(0.0, _number(discipline.get("outs"), 0.0))
+        total_bases = max(0.0, _number(discipline.get("total_bases"), 0.0))
+        prior = 120.0
+        ppa = (pitches + LEAGUE_PITCHES_PER_PA * prior) / (pa + prior)
+        on_base = (hits + walks + hbp + LEAGUE_ON_BASE_PROXY * prior) / (pa + prior)
+        out_rate = (outs + LEAGUE_OUT_RATE * prior) / (pa + prior)
+        tb_per_pa = (total_bases + LEAGUE_TOTAL_BASES_PER_PA * prior) / (pa + prior)
+        weight = _lineup_weight(batter.get("lineup_order"))
+        reliability = pa / (pa + prior) if pa else 0.0
+        for key, value in (("ppa", ppa), ("on_base", on_base), ("out_rate", out_rate), ("tb_per_pa", tb_per_pa)):
+            totals[key] += value * weight
+        coverage += reliability * weight
+        effective_pa += min(pa, prior) * weight / 4.2
+        weight_total += weight
+    if not weight_total:
+        return {
+            "pitches_per_pa": LEAGUE_PITCHES_PER_PA, "on_base_rate": LEAGUE_ON_BASE_PROXY,
+            "out_rate": LEAGUE_OUT_RATE, "total_bases_per_pa": LEAGUE_TOTAL_BASES_PER_PA,
+            "coverage": 0.0, "effective_pa": 0.0,
+        }
+    return {
+        "pitches_per_pa": totals["ppa"] / weight_total,
+        "on_base_rate": totals["on_base"] / weight_total,
+        "out_rate": totals["out_rate"] / weight_total,
+        "total_bases_per_pa": totals["tb_per_pa"] / weight_total,
+        "coverage": clamp(coverage / weight_total, 0.0, 1.0),
+        "effective_pa": effective_pa,
+    }
+
+
+def _team_run_expectation(side):
+    """Derive a small team-scoring context from the free ESPN game market."""
+    context = side.get("market_context") or {}
+    total = _number(context.get("total"))
+    expected = total / 2.0 if total is not None else LEAGUE_GAME_TOTAL / 2.0
+    favorite = context.get("favorite")
+    probability = _number(context.get("favorite_probability"), .55)
+    if favorite:
+        favorite_edge = clamp((probability - .5) / .20, 0.0, 1.0)
+        expected += (.35 if favorite == side.get("batting_team") else -.35) * favorite_edge
+    return clamp(expected, 2.5, 6.5)
+
+
+def _apply_matchup_workload(side, baseline):
+    lineup = lineup_workload_context(side)
+    coverage = lineup["coverage"]
+    pitcher_ppa = baseline["pitcher_pitches_per_batter"]
+    matchup_ppa = clamp(
+        pitcher_ppa + .55 * coverage * (lineup["pitches_per_pa"] - LEAGUE_PITCHES_PER_PA),
+        3.15, 4.65,
+    )
+    team_runs = _team_run_expectation(side)
+    run_environment_adjustment = clamp((team_runs - LEAGUE_GAME_TOTAL / 2.0) * .006, -.012, .012)
+    matchup_on_base = clamp(
+        .65 * baseline["pitcher_baserunner_rate"] + .35 * lineup["on_base_rate"]
+        + run_environment_adjustment,
+        .24, .43,
+    )
+    matchup_out_rate = clamp(
+        .65 * baseline["pitcher_out_rate"] + .35 * lineup["out_rate"]
+        - .50 * run_environment_adjustment,
+        .54, .78,
+    )
+    patience_hook = .18 * (matchup_ppa - pitcher_ppa)
+    traffic_hook = .85 * (matchup_on_base - baseline["pitcher_baserunner_rate"])
+    power_hook = .30 * coverage * (lineup["total_bases_per_pa"] - LEAGUE_TOTAL_BASES_PER_PA)
+    run_hook = .025 * (team_runs - LEAGUE_GAME_TOTAL / 2.0)
+    hook_adjustment = clamp(patience_hook + traffic_hook + power_hook + run_hook, -.12, .18)
+    early_exit_risk = clamp(baseline["base_early_exit_risk"] + hook_adjustment, .05, .75)
+    adjusted_pitch_budget = clamp(
+        baseline["baseline_pitch_budget"] - 32.0 * hook_adjustment,
+        35.0, 115.0,
+    )
+    override = side.get("workload_override") or {}
+    manual_pitch_limit = _number(override.get("pitch_limit"))
+    if manual_pitch_limit is not None:
+        adjusted_pitch_budget = min(adjusted_pitch_budget, manual_pitch_limit)
+    pitch_derived_bf = adjusted_pitch_budget / matchup_ppa
+    expected_bf = .20 * baseline["direct_bf"] + .80 * pitch_derived_bf
+    expected_outs = .25 * baseline["historical_outs"] + .75 * (expected_bf * matchup_out_rate)
+    bf_spread = max(3.0, baseline["bf_spread"] + (1.0 - coverage) * .75 + abs(hook_adjustment) * 4.0)
+    outs_spread = max(3.5, baseline["outs_spread"] + (1.0 - coverage) * .75)
+    pitch_spread = baseline["pitch_spread"]
+    pitch_high = min(125.0, adjusted_pitch_budget + 1.28 * pitch_spread)
+    if manual_pitch_limit is not None:
+        pitch_high = min(pitch_high, manual_pitch_limit)
+    stages = {
+        "baseline_pitch_budget": baseline["baseline_pitch_budget"],
+        "manual_pitch_limit": manual_pitch_limit,
+        "matchup_pitch_budget": adjusted_pitch_budget,
+        "pitcher_pitches_per_batter": pitcher_ppa,
+        "lineup_pitches_per_pa": lineup["pitches_per_pa"],
+        "matchup_pitches_per_batter": matchup_ppa,
+        "pitcher_baserunner_rate": baseline["pitcher_baserunner_rate"],
+        "lineup_on_base_rate": lineup["on_base_rate"],
+        "matchup_baserunner_rate": matchup_on_base,
+        "matchup_out_rate": matchup_out_rate,
+        "team_run_expectation": team_runs,
+        "baseline_early_exit_risk": baseline["base_early_exit_risk"],
+        "matchup_hook_adjustment": hook_adjustment,
+        "lineup_coverage": coverage,
+        "lineup_effective_pa": lineup["effective_pa"],
+        "pitch_derived_bf": pitch_derived_bf,
+        "historical_bf_stabilizer": baseline["direct_bf"],
+    }
+    return {
+        "expected_batters_faced": expected_bf,
+        "batters_faced_interval": [max(8.0, expected_bf - 1.28 * bf_spread), min(36.0, expected_bf + 1.28 * bf_spread)],
+        "expected_pitches": adjusted_pitch_budget,
+        "pitches_interval": [max(20.0, adjusted_pitch_budget - 1.28 * pitch_spread), max(20.0, pitch_high)],
+        "expected_outs": clamp(expected_outs, 3.0, 27.0),
+        "outs_interval": [max(3.0, expected_outs - 1.28 * outs_spread), min(27.0, expected_outs + 1.28 * outs_spread)],
+        "early_exit_risk": early_exit_risk,
+        "pitches_per_batter": matchup_ppa,
+        "appearances": baseline["appearances"],
+        "source": baseline["source"] + " plus opponent workload context",
+        "lineup_workload_context": lineup,
+        "workload_stages": stages,
+    }
+
+
 def _workload_estimate(side):
     starts = [row for row in side.get("appearance_history", []) if row.get("is_start")]
+    starts = [row for row in starts if _number(row.get("batters_faced"), 0.0) > 0]
     if starts:
-        season = [_number(row.get("batters_faced"), 0.0) for row in starts]
-        recent = season[-3:]
-        expected = (LEAGUE_BF_PER_START * 4 + sum(season) + 0.5 * sum(recent)) / (4 + len(season) + 0.5 * len(recent))
-        spread = max(2.5, sqrt(sum((value - expected) ** 2 for value in season) / max(1, len(season) - 1)))
-        return expected, max(8.0, expected - 1.28 * spread), expected + 1.28 * spread, len(starts), "start-only history"
+        recent = starts[-5:]
+
+        def blended(key, prior, prior_weight=3.0):
+            season_values = [_number(row.get(key)) for row in starts]
+            season_values = [value for value in season_values if value is not None]
+            recent_values = [_number(row.get(key)) for row in recent]
+            recent_values = [value for value in recent_values if value is not None]
+            numerator = prior * prior_weight + sum(season_values) + .65 * sum(recent_values)
+            denominator = prior_weight + len(season_values) + .65 * len(recent_values)
+            return numerator / denominator if denominator else prior
+
+        batters = [_number(row.get("batters_faced"), 0.0) for row in starts]
+        total_bf = sum(batters)
+        pitch_rows = [row for row in starts if row.get("pitches") is not None]
+        pitch_bf = sum(_number(row.get("batters_faced"), 0.0) for row in pitch_rows)
+        total_pitches = sum(_number(row.get("pitches"), 0.0) for row in pitch_rows)
+        command_rows = [row for row in starts if row.get("hits_allowed") is not None and row.get("walks_allowed") is not None]
+        command_bf = sum(_number(row.get("batters_faced"), 0.0) for row in command_rows)
+        hits_walks = sum(_number(row.get("hits_allowed"), 0.0) + _number(row.get("walks_allowed"), 0.0) for row in command_rows)
+        out_rows = [row for row in starts if row.get("outs") is not None]
+        out_bf = sum(_number(row.get("batters_faced"), 0.0) for row in out_rows)
+        total_outs = sum(_number(row.get("outs"), 0.0) for row in out_rows)
+        baseline_pitches = blended("pitches", 85.0)
+        direct_bf = blended("batters_faced", LEAGUE_BF_PER_START)
+        historical_outs = blended("outs", 16.5)
+        pitch_values = [_number(row.get("pitches"), baseline_pitches) for row in starts]
+        outs_values = [_number(row.get("outs"), historical_outs) for row in starts]
+        shortened = sum(int(
+            _number(row.get("batters_faced"), 0) < 18
+            or (row.get("outs") is not None and _number(row.get("outs"), 0) < 15)
+            or (row.get("pitches") is not None and _number(row.get("pitches"), 0) < 70)
+        ) for row in starts)
+        baseline = {
+            "baseline_pitch_budget": baseline_pitches,
+            "direct_bf": direct_bf,
+            "historical_outs": historical_outs,
+            "pitcher_pitches_per_batter": (total_pitches + LEAGUE_PITCHES_PER_PA * 80.0) / (pitch_bf + 80.0),
+            "pitcher_baserunner_rate": shrunk_rate(hits_walks, command_bf, LEAGUE_ON_BASE_PROXY, 100.0),
+            "pitcher_out_rate": shrunk_rate(total_outs, out_bf, LEAGUE_OUT_RATE, 100.0),
+            "base_early_exit_risk": (shortened + 1.5) / (len(starts) + 6.0),
+            "bf_spread": max(2.75, sqrt(sum((value - direct_bf) ** 2 for value in batters) / max(1, len(batters) - 1))),
+            "pitch_spread": max(10.0, sqrt(sum((value - baseline_pitches) ** 2 for value in pitch_values) / max(1, len(pitch_values) - 1))),
+            "outs_spread": max(3.0, sqrt(sum((value - historical_outs) ** 2 for value in outs_values) / max(1, len(outs_values) - 1))),
+            "appearances": len(starts),
+            "source": "start-only pitch budget",
+        }
+        return _apply_matchup_workload(side, baseline)
+
     workload = side.get("workload") or {}
     appearances = int(_number(workload.get("appearances"), 0))
     batters_faced = _number(workload.get("batters_faced"), 0.0)
-    recent_appearances = int(_number(workload.get("recent_appearances"), 0))
-    recent_bf = _number(workload.get("recent_batters_faced"), 0.0)
-    if not appearances or not batters_faced:
-        return LEAGUE_BF_PER_START, 14.0, 28.0, 0, "league prior"
-    season_mean = batters_faced / appearances
-    recent_mean = recent_bf / recent_appearances if recent_appearances else season_mean
-    expected = (LEAGUE_BF_PER_START * 4 + season_mean * appearances + recent_mean * min(recent_appearances, 3)) / (4 + appearances + min(recent_appearances, 3))
-    spread = max(3.0, abs(season_mean - recent_mean) + 2.0)
-    return expected, max(8.0, expected - spread), expected + spread, appearances, "mixed-role aggregate fallback"
+    if appearances and batters_faced:
+        baseline_pitches = _number(workload.get("pitches"), 0.0) / appearances
+        direct_bf = batters_faced / appearances
+        historical_outs = _number(workload.get("outs"), 0.0) / appearances
+        baseline = {
+            "baseline_pitch_budget": baseline_pitches or 85.0,
+            "direct_bf": direct_bf,
+            "historical_outs": historical_outs or 16.5,
+            "pitcher_pitches_per_batter": (_number(workload.get("pitches"), 0.0) + LEAGUE_PITCHES_PER_PA * 80.0) / (batters_faced + 80.0),
+            "pitcher_baserunner_rate": LEAGUE_ON_BASE_PROXY,
+            "pitcher_out_rate": (historical_outs / direct_bf) if direct_bf else LEAGUE_OUT_RATE,
+            "base_early_exit_risk": .35, "bf_spread": 3.5, "pitch_spread": 16.0,
+            "outs_spread": 4.5, "appearances": appearances,
+            "source": "mixed-role aggregate fallback",
+        }
+        return _apply_matchup_workload(side, baseline)
+    return _apply_matchup_workload(side, {
+        "baseline_pitch_budget": 85.0, "direct_bf": LEAGUE_BF_PER_START,
+        "historical_outs": 16.5, "pitcher_pitches_per_batter": LEAGUE_PITCHES_PER_PA,
+        "pitcher_baserunner_rate": LEAGUE_ON_BASE_PROXY, "pitcher_out_rate": LEAGUE_OUT_RATE,
+        "base_early_exit_risk": .35, "bf_spread": 4.5, "pitch_spread": 18.0,
+        "outs_spread": 5.0, "appearances": 0, "source": "league prior",
+    })
+
+
+def pitcher_performance_outlook(side, estimate):
+    """Describe workload, command, and run suppression separately from Ks."""
+    starts = [row for row in side.get("appearance_history", []) if row.get("is_start")]
+    innings = sum(_number(row.get("outs"), 0.0) for row in starts) / 3.0
+    walks = sum(_number(row.get("walks_allowed"), 0.0) for row in starts)
+    hits = sum(_number(row.get("hits_allowed"), 0.0) for row in starts)
+    earned_runs = sum(_number(row.get("earned_runs"), 0.0) for row in starts)
+    command_sample = any(row.get("walks_allowed") is not None for row in starts)
+    run_sample = any(row.get("earned_runs") is not None for row in starts)
+    whip = (walks + hits) / innings if command_sample and innings else None
+    earned_run_rate = earned_runs * 9.0 / innings if run_sample and innings else None
+    early_exit = estimate["early_exit_risk"]
+    if early_exit >= .38:
+        exit_label, exit_tone = "elevated early-exit risk", "bad"
+    elif early_exit <= .20:
+        exit_label, exit_tone = "lower early-exit risk", "good"
+    else:
+        exit_label, exit_tone = "typical early-exit risk", "neutral"
+    if whip is None:
+        command_label, command_tone = "command history pending", "neutral"
+    elif whip <= 1.15:
+        command_label, command_tone = "limits baserunners", "good"
+    elif whip >= 1.45:
+        command_label, command_tone = "elevated traffic risk", "bad"
+    else:
+        command_label, command_tone = "average traffic risk", "neutral"
+    if earned_run_rate is None:
+        run_label, run_tone = "run history pending", "neutral"
+    elif earned_run_rate <= 3.5:
+        run_label, run_tone = "strong run suppression", "good"
+    elif earned_run_rate >= 5.0:
+        run_label, run_tone = "elevated run risk", "bad"
+    else:
+        run_label, run_tone = "average run suppression", "neutral"
+    return {
+        "expected_outs": estimate["expected_outs"],
+        "outs_interval": estimate["outs_interval"],
+        "expected_innings": estimate["expected_outs"] / 3.0,
+        "expected_pitches": estimate["expected_pitches"],
+        "pitches_interval": estimate["pitches_interval"],
+        "early_exit_risk": early_exit,
+        "early_exit_label": exit_label,
+        "early_exit_tone": exit_tone,
+        "whip_history": whip,
+        "command_label": command_label,
+        "command_tone": command_tone,
+        "earned_runs_per_nine": earned_run_rate,
+        "run_suppression_label": run_label,
+        "run_suppression_tone": run_tone,
+        "matchup_pitches_per_batter": estimate["workload_stages"]["matchup_pitches_per_batter"],
+        "matchup_baserunner_rate": estimate["workload_stages"]["matchup_baserunner_rate"],
+        "matchup_out_rate": estimate["workload_stages"]["matchup_out_rate"],
+        "team_run_expectation": estimate["workload_stages"]["team_run_expectation"],
+        "starts": len(starts),
+    }
 
 
 def evaluate_market(distribution, market):
@@ -383,16 +780,30 @@ def pitcher_k_projection(side, market=None, as_of=None, scheduled_start=None):
     # Broader, handedness-matched hitter K history is the primary opponent
     # adjustment. Sparse exact-pitch evidence is deliberately a smaller
     # refinement instead of a prerequisite for a useful projection.
-    lineup_adjustment = .75 * (lineup_evidence["rate"] - LEAGUE_K_RATE)
-    pitch_weight = pitch_evidence["effective_sample_size"] / (pitch_evidence["effective_sample_size"] + 120.0)
-    pitch_adjustment = pitch_weight * (pitch_evidence["rate"] - pitcher_rate)
+    # The confirmed-lineup split remains the primary opponent input, but its
+    # influence now scales with evidence coverage. Exact-pitch final-PA data is
+    # intentionally capped because it is much sparser and was over-influential
+    # in v2 before any settled calibration sample existed.
+    lineup_weight = .45 + .25 * lineup_evidence["coverage"]
+    lineup_adjustment = lineup_weight * (lineup_evidence["rate"] - LEAGUE_K_RATE)
+    pitch_weight = .25 * pitch_evidence["coverage"] * (
+        pitch_evidence["effective_sample_size"] / (pitch_evidence["effective_sample_size"] + 180.0)
+    )
+    pitch_adjustment = clamp(pitch_weight * (pitch_evidence["rate"] - pitcher_rate), -.012, .012)
     k_rate = clamp(pitcher_rate + lineup_adjustment + pitch_adjustment, 0.06, 0.45)
-    expected_bf, bf_low, bf_high, appearances, workload_source = _workload_estimate(side)
+    workload_estimate = _workload_estimate(side)
+    expected_bf = workload_estimate["expected_batters_faced"]
+    bf_low, bf_high = workload_estimate["batters_faced_interval"]
+    appearances = workload_estimate["appearances"]
     expected_ks = k_rate * expected_bf
-    leash = workload_read(side, expected_bf, appearances, workload_source)
+    leash = workload_read(side, workload_estimate)
+    performance_outlook = pitcher_performance_outlook(side, workload_estimate)
     opportunity = k_opportunity_read(k_rate, expected_ks, lineup_evidence["rate"], leash)
     line = _number((market or {}).get("line"))
-    distribution = distribution_summary(expected_ks, line, kind="negative_binomial", dispersion=12.0)
+    rate_strength = clamp(80.0 + .15 * bf + .25 * lineup_evidence["effective_sample_size"], 80.0, 240.0)
+    distribution = workload_k_distribution(
+        k_rate, expected_bf, bf_low, bf_high, line, rate_strength=rate_strength,
+    )
     market_read = evaluate_market(distribution, market)
     lineup_confirmed = side.get("lineup_confirmed") is True
     data_freshness_seconds = _number(side.get("data_freshness_seconds"))
@@ -434,6 +845,10 @@ def pitcher_k_projection(side, market=None, as_of=None, scheduled_start=None):
         f"Lineup K-risk adjustment {lineup_adjustment:+.1%}",
         f"Pitch-mix adjustment {pitch_adjustment:+.1%}",
         f"Expected workload {expected_bf:.1f} batters faced",
+        f"Expected pitch budget {workload_estimate['expected_pitches']:.0f} pitches",
+        f"Opponent-adjusted efficiency {workload_estimate['pitches_per_batter']:.2f} pitches per batter",
+        f"Opponent workload coverage {workload_estimate['lineup_workload_context']['coverage']:.0%}",
+        f"Early-exit risk {workload_estimate['early_exit_risk']:.0%}",
     ]
     missing = []
     if not lineup_confirmed:
@@ -462,6 +877,7 @@ def pitcher_k_projection(side, market=None, as_of=None, scheduled_start=None):
         "projection": expected_ks,
         "k_rate": k_rate,
         "expected_batters_faced": expected_bf,
+        "expected_pitches": workload_estimate["expected_pitches"],
         "batters_faced_interval": [bf_low, bf_high],
         "median": distribution["median"],
         "interval_low": distribution["interval_low"],
@@ -472,6 +888,7 @@ def pitcher_k_projection(side, market=None, as_of=None, scheduled_start=None):
         "fair_over_price": distribution.get("fair_over_price"),
         "fair_under_price": distribution.get("fair_under_price"),
         "distribution": distribution["distribution"],
+        "milestone_probabilities": distribution["milestones"],
         "confidence": confidence,
         "arsenal_coverage": pitch_coverage,
         "effective_sample_size": pitch_evidence["effective_sample_size"],
@@ -481,12 +898,22 @@ def pitcher_k_projection(side, market=None, as_of=None, scheduled_start=None):
         "data_grade": data_grade,
         "opportunity": opportunity,
         "workload_read": leash,
+        "performance_outlook": performance_outlook,
+        "workload_stages": workload_estimate["workload_stages"],
+        "lineup_workload_context": workload_estimate["lineup_workload_context"],
         "components": {
             "baseline_k_rate": pitcher_rate,
             "lineup_adjustment": lineup_adjustment,
             "pitch_adjustment": pitch_adjustment,
             "matchup_k_rate": k_rate,
             "expected_batters_faced": expected_bf,
+            "expected_pitches": workload_estimate["expected_pitches"],
+            "expected_outs": workload_estimate["expected_outs"],
+            "early_exit_risk": workload_estimate["early_exit_risk"],
+            "matchup_pitches_per_batter": workload_estimate["pitches_per_batter"],
+            "matchup_baserunner_rate": workload_estimate["workload_stages"]["matchup_baserunner_rate"],
+            "matchup_out_rate": workload_estimate["workload_stages"]["matchup_out_rate"],
+            "matchup_hook_adjustment": workload_estimate["workload_stages"]["matchup_hook_adjustment"],
         },
         "lineup_confirmed": lineup_confirmed,
         "decision": decision,
@@ -584,7 +1011,10 @@ def hitter_opportunity_reads(batter, metrics, market_context):
     hr_rate = metrics["hr_rate"]
     hard_hit_rate = metrics["hard_hit_rate"]
     barrel_rate = metrics["barrel_rate"]
-    k_rate = hitter_k_risk(batter.get("k_profile"))["posterior"]
+    k_rate = _number(
+        metrics.get("k_rate"),
+        hitter_k_risk(batter.get("k_profile"))["posterior"],
+    )
     lineup_order = batter.get("lineup_order")
     lineup_number = _number(lineup_order)
     projected_pa = _lineup_weight(lineup_order)
@@ -771,4 +1201,159 @@ def hitter_arsenal_summary(batter, pitches, league_average=LEAGUE_HITTER_AVERAGE
         "hr_rate": hr_rate,
     }
     result["opportunities"] = hitter_opportunity_reads(batter, result, market_context)
+    return result
+
+
+def blend_full_game_hitter_matchup(batter, starter_summary, bullpen_entries,
+                                   expected_batters_faced,
+                                   batters_faced_interval=None,
+                                   market_context=None):
+    """Blend starter and appearance-weighted reliever evidence by expected PA.
+
+    ``bullpen_entries`` contains ``weight`` plus an optional reliever ``summary``.
+    Missing reliever arsenals keep their probability mass and contribute a
+    league-average prior, preventing a thin modeled subset from being
+    renormalized into false certainty.
+    """
+    starter = dict(starter_summary or {})
+    market_context = market_context or starter.get("market_context") or hitter_market_context(None, None)
+    projected_pa = _lineup_weight(batter.get("lineup_order"))
+    starter_pa = min(
+        projected_pa,
+        expected_starter_plate_appearances(
+            batter.get("lineup_order"), expected_batters_faced, batters_faced_interval,
+        ),
+    )
+    bullpen_pa = max(0.0, projected_pa - starter_pa)
+    starter_share = starter_pa / projected_pa if projected_pa else 1.0
+    bullpen_share = 1.0 - starter_share
+
+    entries = list(bullpen_entries or [])
+    raw_total = sum(max(0.0, _number(entry.get("weight"), 0.0)) for entry in entries)
+    metric_defaults = {
+        "expected_average": LEAGUE_HITTER_AVERAGE,
+        "expected_slg": LEAGUE_HITTER_SLG,
+        "expected_iso": LEAGUE_HITTER_ISO,
+        "hard_hit_rate": LEAGUE_HARD_HIT_RATE,
+        "barrel_rate": LEAGUE_BARREL_PROXY_RATE,
+        "hr_rate": LEAGUE_HITTER_HR_RATE,
+        "base_score": 0.0,
+        "coverage": 0.0,
+        "context_coverage": 0.0,
+        "quality_coverage": 0.0,
+        "effective_sample_size": 0.0,
+    }
+    bullpen = dict(metric_defaults)
+    starter_k_rate = hitter_k_risk(batter.get("k_profile"))["posterior"]
+    bullpen_k_rate = LEAGUE_K_RATE
+    modeled_weight = 0.0
+    mix = []
+    if raw_total > 0:
+        for entry in entries:
+            normalized = max(0.0, _number(entry.get("weight"), 0.0)) / raw_total
+            summary = entry.get("summary") or {}
+            if summary:
+                modeled_weight += normalized
+            reliever_k = hitter_k_risk(entry.get("k_profile"))["posterior"] if entry.get("k_profile") else LEAGUE_K_RATE
+            bullpen_k_rate += normalized * (reliever_k - LEAGUE_K_RATE)
+            for metric, default in metric_defaults.items():
+                value = _number(summary.get(metric), default)
+                bullpen[metric] += normalized * (value - default)
+            mix.append({
+                "player_id": entry.get("player_id"),
+                "name": entry.get("name"),
+                "weight": round(normalized, 4),
+                "status": entry.get("status"),
+                "role": entry.get("role"),
+                "modeled": bool(summary),
+            })
+
+    if raw_total <= 0:
+        # No readiness snapshot yet: show the starter-only result without
+        # pretending an unknown bullpen is league average evidence.
+        bullpen_share = 0.0
+        starter_share = 1.0
+        starter_pa = projected_pa
+        bullpen_pa = 0.0
+
+    result = {}
+    for metric, default in metric_defaults.items():
+        starter_value = _number(starter.get(metric), default)
+        result[metric] = starter_share * starter_value + bullpen_share * bullpen[metric]
+    result["coverage"] = clamp(result["coverage"], 0.0, 1.0)
+    result["context_coverage"] = clamp(result["context_coverage"], 0.0, 1.0)
+    result["quality_coverage"] = clamp(result["quality_coverage"], 0.0, 1.0)
+    result["delta"] = result["expected_average"] - LEAGUE_HITTER_AVERAGE
+    result["k_rate"] = starter_share * starter_k_rate + bullpen_share * bullpen_k_rate
+    result["score"] = result["base_score"] + _number(market_context.get("adjustment"), 0.0)
+    result["market_context"] = market_context
+    if result["coverage"] < HITTER_ARSENAL_MIN_COVERAGE or result["effective_sample_size"] < HITTER_ARSENAL_MIN_EFFECTIVE_PA:
+        result.update({"label": "insufficient", "tier": "watchlist", "tone": "neutral"})
+    elif result["score"] >= HITTER_CONTACT_DELTA:
+        result.update({"label": "strong full-game research", "tier": "strong", "tone": "good"})
+    elif result["score"] >= HITTER_CONTACT_FAVORABLE_DELTA:
+        result.update({"label": "favorable full-game research", "tier": "favorable", "tone": "good"})
+    elif result["score"] <= -HITTER_CONTACT_DELTA:
+        result.update({"label": "tough full-game research", "tier": "tough", "tone": "bad"})
+    else:
+        result.update({"label": "neutral full-game research", "tier": "neutral", "tone": "neutral"})
+
+    opportunities = hitter_opportunity_reads(batter, result, market_context)
+    starter_overall = ((starter.get("opportunities") or {}).get("items") or {}).get("overall", {})
+    full_overall = opportunities["items"]["overall"]
+    opportunity_delta = _number(full_overall.get("score"), 0.0) - _number(starter_overall.get("score"), 0.0)
+    bullpen_coverage = clamp(_number(bullpen.get("coverage"), 0.0), 0.0, 1.0)
+    if not raw_total:
+        effect, effect_label = "unknown", "Bullpen not modeled"
+    elif modeled_weight < 0.55 or bullpen_coverage < 0.20:
+        effect, effect_label = "uncertain", "Bullpen uncertainty"
+    elif opportunity_delta >= 0.18:
+        effect, effect_label = "boost", "Bullpen boost"
+    elif opportunity_delta <= -0.18:
+        effect, effect_label = "downgrade", "Bullpen downgrade"
+    elif opportunity_delta <= -0.08:
+        effect, effect_label = "slight_downgrade", "Bullpen slightly lowers outlook"
+    elif opportunity_delta >= -0.03 and full_overall.get("tier") in {"strong", "favorable"} and starter_overall.get("tier") in {"strong", "favorable"}:
+        effect, effect_label = "supported", "Bullpen supported"
+    else:
+        effect, effect_label = "neutral", "Bullpen neutral"
+    for opportunity in opportunities["items"].values():
+        drivers = list(opportunity.get("drivers") or [])
+        risks = list(opportunity.get("risks") or [])
+        if effect in {"boost", "supported", "neutral"}:
+            direction = "+" if opportunity_delta >= 0 else ""
+            drivers.insert(1, f"{effect_label} ({direction}{opportunity_delta:.2f})")
+        elif effect in {"downgrade", "slight_downgrade"}:
+            risks.insert(0, f"{effect_label} ({opportunity_delta:.2f})")
+        elif effect in {"uncertain", "unknown"}:
+            risks.insert(0, effect_label)
+        opportunity["drivers"] = list(dict.fromkeys(drivers))[:3]
+        opportunity["risks"] = list(dict.fromkeys(risks))[:3]
+    result["opportunities"] = opportunities
+    result["exposure"] = {
+        "projected_pa": round(projected_pa, 2),
+        "starter_pa": round(starter_pa, 2),
+        "bullpen_pa": round(bullpen_pa, 2),
+        "starter_share": round(starter_share, 4),
+        "bullpen_share": round(bullpen_share, 4),
+    }
+    result["starter"] = {
+        "expected_average": _number(starter.get("expected_average"), LEAGUE_HITTER_AVERAGE),
+        "expected_slg": _number(starter.get("expected_slg"), LEAGUE_HITTER_SLG),
+        "expected_iso": _number(starter.get("expected_iso"), LEAGUE_HITTER_ISO),
+        "score": _number(starter.get("score"), 0.0),
+        "tier": starter.get("tier", "watchlist"),
+        "tone": starter.get("tone", "neutral"),
+    }
+    result["bullpen"] = {
+        **bullpen,
+        "k_rate": bullpen_k_rate,
+        "modeled_weight": round(modeled_weight, 4),
+        "mix": sorted(mix, key=lambda item: item["weight"], reverse=True),
+    }
+    result["bullpen_effect"] = {
+        "key": effect,
+        "label": effect_label,
+        "opportunity_delta": round(opportunity_delta, 3),
+    }
     return result

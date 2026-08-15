@@ -121,11 +121,38 @@ def evaluate(rows):
         close_no_vig = no_vig_probabilities(row.get("closing_over_price"), row.get("closing_under_price"))
         if bet_no_vig and close_no_vig and row.get("closing_line") == row.get("line"):
             closing_differences.append(close_no_vig["over"] - bet_no_vig["over"])
+    def component_error(projected_key, actual_key):
+        pairs = [
+            (float(row[projected_key]), float(row[actual_key]))
+            for row in settled
+            if row.get(projected_key) is not None and row.get(actual_key) is not None
+        ]
+        return {
+            "count": len(pairs),
+            "mae": sum(abs(projected - actual) for projected, actual in pairs) / len(pairs) if pairs else None,
+            "bias": sum(projected - actual for projected, actual in pairs) / len(pairs) if pairs else None,
+        }
+
+    k_rate_pairs = [
+        (float(row["projected_k_rate"]), float(row["actual_value"]) / float(row["actual_batters_faced"]))
+        for row in settled
+        if row.get("projected_k_rate") is not None and row.get("actual_batters_faced") not in (None, 0)
+    ]
     report = {
         "status": "ok",
         "count": count,
         "mae": sum(abs(row["error"]) for row in settled) / count,
         "rmse": sqrt(sum(row["error"] ** 2 for row in settled) / count),
+        "components": {
+            "workload_batters_faced": component_error("projected_batters_faced", "actual_batters_faced"),
+            "pitch_count": component_error("projected_pitches", "actual_pitches"),
+            "outs": component_error("projected_outs", "actual_outs"),
+            "k_rate": {
+                "count": len(k_rate_pairs),
+                "mae": sum(abs(projected - actual) for projected, actual in k_rate_pairs) / len(k_rate_pairs) if k_rate_pairs else None,
+                "bias": sum(projected - actual for projected, actual in k_rate_pairs) / len(k_rate_pairs) if k_rate_pairs else None,
+            },
+        },
         "brier": brier,
         "log_loss": log_loss,
         "distribution_comparison": candidate_scores,
@@ -165,7 +192,13 @@ def load_rows(db_path=None, start=None, end=None):
         clauses.append("p.as_of<?")
         params.append(end)
     query = f"""
-      SELECT p.*, r.actual_value, m.line, m.over_price, m.under_price,
+      SELECT p.*, r.actual_value, r.actual_batters_faced, r.actual_pitches, r.actual_outs,
+             r.actual_runs, r.actual_earned_runs, r.actual_hits, r.actual_walks,
+             json_extract(p.inputs_json, '$.expected_batters_faced') AS projected_batters_faced,
+             json_extract(p.inputs_json, '$.expected_pitches') AS projected_pitches,
+             json_extract(p.inputs_json, '$.performance_outlook.expected_outs') AS projected_outs,
+             json_extract(p.inputs_json, '$.k_rate') AS projected_k_rate,
+             m.line, m.over_price, m.under_price,
              closing.line AS closing_line, closing.over_price AS closing_over_price,
              closing.under_price AS closing_under_price,
              substr(p.as_of, 1, 4) AS season,

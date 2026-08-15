@@ -318,6 +318,104 @@ MIGRATIONS = (
     CREATE TRIGGER IF NOT EXISTS immutable_result_update BEFORE UPDATE ON prediction_results BEGIN SELECT RAISE(ABORT, 'prediction_results is immutable'); END;
     CREATE TRIGGER IF NOT EXISTS immutable_result_delete BEFORE DELETE ON prediction_results BEGIN SELECT RAISE(ABORT, 'prediction_results is immutable'); END;
     """),
+    (5, """
+    ALTER TABLE gameday_pitcher_arsenal ADD COLUMN swings INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE gameday_pitcher_arsenal ADD COLUMN whiffs INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE gameday_pitcher_arsenal ADD COLUMN chases INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE gameday_pitcher_arsenal ADD COLUMN strikeouts INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE player_game_observations ADD COLUMN walks_allowed INTEGER;
+    ALTER TABLE player_game_observations ADD COLUMN hits_allowed INTEGER;
+    ALTER TABLE player_game_observations ADD COLUMN runs_allowed INTEGER;
+    ALTER TABLE player_game_observations ADD COLUMN earned_runs INTEGER;
+    ALTER TABLE prediction_results ADD COLUMN actual_batters_faced REAL;
+    ALTER TABLE prediction_results ADD COLUMN actual_pitches REAL;
+    ALTER TABLE prediction_results ADD COLUMN actual_outs REAL;
+    ALTER TABLE prediction_results ADD COLUMN actual_runs REAL;
+    ALTER TABLE prediction_results ADD COLUMN actual_earned_runs REAL;
+    ALTER TABLE prediction_results ADD COLUMN actual_hits REAL;
+    ALTER TABLE prediction_results ADD COLUMN actual_walks REAL;
+    """),
+    (6, """
+    CREATE TABLE IF NOT EXISTS pitcher_game_results (
+      game_pk INTEGER NOT NULL,
+      player_id INTEGER NOT NULL,
+      batters_faced INTEGER,
+      strikeouts INTEGER,
+      outs INTEGER,
+      pitches INTEGER,
+      walks_allowed INTEGER,
+      hits_allowed INTEGER,
+      runs_allowed INTEGER,
+      earned_runs INTEGER,
+      observed_at TEXT NOT NULL,
+      source TEXT NOT NULL DEFAULT 'mlb-gameday-boxscore',
+      PRIMARY KEY (game_pk, player_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_pitcher_results_player_game
+      ON pitcher_game_results(player_id, game_pk);
+    CREATE TRIGGER IF NOT EXISTS immutable_pitcher_results_update BEFORE UPDATE ON pitcher_game_results BEGIN SELECT RAISE(ABORT, 'pitcher_game_results is immutable'); END;
+    CREATE TRIGGER IF NOT EXISTS immutable_pitcher_results_delete BEFORE DELETE ON pitcher_game_results BEGIN SELECT RAISE(ABORT, 'pitcher_game_results is immutable'); END;
+    """),
+    (7, """
+    CREATE TABLE IF NOT EXISTS gameday_batter_discipline (
+      season INTEGER NOT NULL,
+      player_id INTEGER NOT NULL,
+      plate_appearances INTEGER NOT NULL,
+      pitches_seen INTEGER NOT NULL,
+      walks INTEGER NOT NULL,
+      hit_by_pitch INTEGER NOT NULL,
+      hits INTEGER NOT NULL,
+      total_bases INTEGER NOT NULL,
+      outs INTEGER NOT NULL,
+      PRIMARY KEY (season, player_id)
+    );
+    CREATE TABLE IF NOT EXISTS workload_overrides (
+      workload_override_id INTEGER PRIMARY KEY AUTOINCREMENT,
+      captured_at TEXT NOT NULL,
+      game_pk INTEGER NOT NULL,
+      player_id INTEGER NOT NULL,
+      player_name TEXT NOT NULL,
+      pitch_limit REAL NOT NULL,
+      source TEXT NOT NULL DEFAULT 'manual',
+      note TEXT,
+      imported_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_workload_override_lookup
+      ON workload_overrides(game_pk, player_id, captured_at);
+    CREATE TRIGGER IF NOT EXISTS immutable_workload_override_update BEFORE UPDATE ON workload_overrides BEGIN SELECT RAISE(ABORT, 'workload_overrides is immutable'); END;
+    CREATE TRIGGER IF NOT EXISTS immutable_workload_override_delete BEFORE DELETE ON workload_overrides BEGIN SELECT RAISE(ABORT, 'workload_overrides is immutable'); END;
+    """),
+    (8, """
+    CREATE TABLE IF NOT EXISTS bullpen_snapshots (
+      bullpen_snapshot_id INTEGER PRIMARY KEY AUTOINCREMENT,
+      game_pk INTEGER NOT NULL,
+      team_id INTEGER NOT NULL,
+      team_name TEXT NOT NULL,
+      scheduled_start TEXT,
+      captured_at TEXT NOT NULL,
+      player_id INTEGER NOT NULL,
+      player_name TEXT NOT NULL,
+      throws TEXT,
+      role TEXT NOT NULL,
+      readiness_score REAL NOT NULL,
+      readiness_status TEXT NOT NULL,
+      mix_weight REAL NOT NULL,
+      pitches_today INTEGER NOT NULL,
+      pitches_yesterday INTEGER NOT NULL,
+      pitches_two_days_ago INTEGER NOT NULL,
+      three_day_pitches INTEGER NOT NULL,
+      consecutive_days INTEGER NOT NULL,
+      days_rest INTEGER,
+      recent_appearances INTEGER NOT NULL,
+      recent_starts INTEGER NOT NULL,
+      arsenal_available INTEGER NOT NULL CHECK (arsenal_available IN (0, 1)),
+      source TEXT NOT NULL DEFAULT 'mlb-gameday-workload'
+    );
+    CREATE INDEX IF NOT EXISTS idx_bullpen_snapshot_lookup
+      ON bullpen_snapshots(game_pk, team_id, captured_at, player_id);
+    CREATE TRIGGER IF NOT EXISTS immutable_bullpen_snapshot_update BEFORE UPDATE ON bullpen_snapshots BEGIN SELECT RAISE(ABORT, 'bullpen_snapshots is immutable'); END;
+    CREATE TRIGGER IF NOT EXISTS immutable_bullpen_snapshot_delete BEFORE DELETE ON bullpen_snapshots BEGIN SELECT RAISE(ABORT, 'bullpen_snapshots is immutable'); END;
+    """),
 )
 
 def connect(db_path=None):

@@ -13,7 +13,11 @@ import argparse
 import json
 
 from analytics_store import connect, initialize
-from prediction_store import is_before_start, record_game, record_pregame_snapshot, utc_now
+from modeling import bullpen_readiness
+from prediction_store import (
+    is_before_start, record_bullpen_snapshot, record_game,
+    record_pregame_snapshot, utc_now,
+)
 
 MLB = "https://statsapi.mlb.com/api/v1"
 MLB_FEED = "https://statsapi.mlb.com/api/v1.1"
@@ -26,6 +30,21 @@ NOT_AB = {"walk", "intent_walk", "hit_by_pitch", "sac_bunt", "sac_fly", "catcher
 STRIKEOUTS = {"strikeout", "strikeout_double_play"}
 OUTS = {"field_out", "force_out", "grounded_into_double_play", "strikeout", "strikeout_double_play", "sac_bunt", "sac_fly", "double_play", "triple_play", "fielders_choice_out", "other_out"}
 PLAYER_GAME_LOG_CACHE = {}
+
+
+def pitcher_pitch_record():
+    """Mutable counters used to build one pitcher's per-pitch profile."""
+    return {
+        "name": "Pitch", "speeds": [], "zones": [0] * 9,
+        "swings": 0, "whiffs": 0, "chases": 0, "strikeouts": 0,
+    }
+
+def batter_discipline_record():
+    """Season counters used for opponent patience and baserunner context."""
+    return {
+        "plate_appearances": 0, "pitches_seen": 0, "walks": 0,
+        "hit_by_pitch": 0, "hits": 0, "total_bases": 0, "outs": 0,
+    }
 
 def batter_context_store():
     """Return batter → pitch → velo → hand → count → zone → events.
@@ -158,6 +177,16 @@ def active_batters(team_id):
     roster = mlb(f"/teams/{team_id}/roster", {"rosterType": "active"}).get("roster", [])
     return {player["person"]["id"]: player["person"] for player in roster if player.get("position", {}).get("type") != "Pitcher"}
 
+
+def active_pitchers(team_id):
+    """Return current active-roster pitchers for bullpen candidate discovery."""
+    roster = mlb(f"/teams/{team_id}/roster", {"rosterType": "active"}).get("roster", [])
+    return {
+        player["person"]["id"]: player["person"]
+        for player in roster
+        if player.get("position", {}).get("type") == "Pitcher"
+    }
+
 def completed_team_games(team_id, season, through_date):
     schedule = mlb("/schedule", {"sportId": 1, "teamId": team_id, "season": season, "gameType": "R", "startDate": f"{season}-03-01", "endDate": through_date})
     games = []
@@ -166,6 +195,101 @@ def completed_team_games(team_id, season, through_date):
             if game.get("status", {}).get("abstractGameState") == "Final":
                 games.append(game["gamePk"])
     return games
+
+
+def completed_team_games_on_date(team_id, game_date):
+    """Include an earlier completed doubleheader game in bullpen workload."""
+    schedule = mlb("/schedule", {"sportId": 1, "teamId": team_id, "date": game_date})
+    return [
+        game["gamePk"]
+        for day in schedule.get("dates", [])
+        for game in day.get("games", [])
+        if game.get("status", {}).get("abstractGameState") == "Final"
+    ]
+
+
+def bullpen_snapshot_rows(db, roster, starter_id, team_id, target_date):
+    """Estimate reliever readiness and a relative appearance-mix weight."""
+    target = datetime.fromisoformat(target_date).date()
+    earliest = (target - timedelta(days=60)).isoformat()
+    output = []
+    for player_id, person in roster.items():
+        if player_id == starter_id:
+            continue
+        observations = [dict(row) for row in db.execute(
+            """SELECT game_date, is_start, pitches, outs, throws
+               FROM player_game_observations
+               WHERE player_id=? AND role='pitcher' AND game_date BETWEEN ? AND ?
+               ORDER BY game_date, game_pk""",
+            (player_id, earliest, target_date),
+        )]
+        recent_30 = [row for row in observations if row["game_date"] >= (target - timedelta(days=30)).isoformat()]
+        starts = sum(int(row.get("is_start") or 0) for row in recent_30)
+        relief = [row for row in recent_30 if not row.get("is_start")]
+        # Keep swingmen, but remove obvious rotation members from the bullpen pool.
+        if starts >= 3 and starts > len(relief) * 2:
+            continue
+        average_relief_outs = (
+            sum(int(row.get("outs") or 0) for row in relief) / len(relief)
+            if relief else 0.0
+        )
+        if not observations:
+            role, role_weight = "Unknown role", 0.45
+        elif starts and starts >= len(relief):
+            role, role_weight = "Swing / long relief", 0.45
+        elif average_relief_outs >= 4.5:
+            role, role_weight = "Long relief", 0.62
+        else:
+            role, role_weight = "Short relief", 1.0
+        pitches_by_date = defaultdict(int)
+        for row in observations:
+            pitches_by_date[row["game_date"]] += int(row.get("pitches") or 0)
+        dates = [(target - timedelta(days=offset)).isoformat() for offset in range(3)]
+        today, yesterday, two_days = (pitches_by_date[day] for day in dates)
+        used_dates = {day for day, pitches in pitches_by_date.items() if pitches > 0}
+        cursor = target if target.isoformat() in used_dates else target - timedelta(days=1)
+        consecutive_days = 0
+        while cursor.isoformat() in used_dates:
+            consecutive_days += 1
+            cursor -= timedelta(days=1)
+        last_date = max((datetime.fromisoformat(day).date() for day in used_dates), default=None)
+        days_rest = (target - last_date).days if last_date else None
+        readiness = bullpen_readiness(today, yesterday, two_days, consecutive_days)
+        status = readiness["status"] if observations else "unknown"
+        score = readiness["score"] if observations else 60.0
+        recent_relief = sum(
+            not row.get("is_start") and row["game_date"] >= (target - timedelta(days=14)).isoformat()
+            for row in observations
+        )
+        trust = 0.40 + 0.60 * min(1.0, recent_relief / 6.0)
+        mix_weight = (score / 100.0) * role_weight * trust
+        if status == "unlikely":
+            mix_weight *= 0.25
+        arsenal_available = bool(db.execute(
+            "SELECT 1 FROM gameday_pitcher_arsenal WHERE player_id=? LIMIT 1",
+            (player_id,),
+        ).fetchone())
+        throws = next((row.get("throws") for row in reversed(observations) if row.get("throws")), None)
+        output.append({
+            "player_id": player_id,
+            "player_name": person.get("fullName", f"Pitcher {player_id}"),
+            "throws": throws,
+            "role": role,
+            "readiness_score": score,
+            "readiness_status": status,
+            "mix_weight": round(max(0.01, mix_weight), 4),
+            "pitches_today": today,
+            "pitches_yesterday": yesterday,
+            "pitches_two_days_ago": two_days,
+            "three_day_pitches": today + yesterday + two_days,
+            "consecutive_days": consecutive_days,
+            "days_rest": days_rest,
+            "recent_appearances": len(recent_30),
+            "recent_starts": starts,
+            "arsenal_available": arsenal_available,
+            "team_id": team_id,
+        })
+    return sorted(output, key=lambda row: (-row["mix_weight"], row["player_name"]))
 
 def game_log_pks_from_payload(payload, before_date=None):
     """Extract only games strictly before an as-of date to prevent leakage."""
@@ -235,11 +359,18 @@ def completed_game_observations(feed, observed_at=None):
             "batters_faced": 0, "strikeouts": 0, "outs": 0, "pitches": 0,
             "plate_appearances": None, "at_bats": None, "hits": None, "total_bases": None,
             "home_runs": None, "batter_strikeouts": None,
+            "walks_allowed": 0, "hits_allowed": 0, "runs_allowed": 0, "earned_runs": None,
         })
         pitcher_row["batters_faced"] += 1
         pitcher_row["strikeouts"] += int(event in STRIKEOUTS)
         pitcher_row["outs"] += int(event in OUTS)
         pitcher_row["pitches"] += len(pitches)
+        pitcher_row["walks_allowed"] += int(event in {"walk", "intent_walk"})
+        pitcher_row["hits_allowed"] += int(event in HITS)
+        pitcher_row["runs_allowed"] += sum(
+            int(bool((runner.get("details") or {}).get("isScoringEvent")))
+            for runner in play.get("runners", [])
+        )
         batter_key = (batter_id, "batter")
         batter_row = rows.setdefault(batter_key, {
             "game_pk": game_pk, "game_date": game_date, "player_id": batter_id,
@@ -248,6 +379,7 @@ def completed_game_observations(feed, observed_at=None):
             "batters_faced": None, "strikeouts": None, "outs": None, "pitches": None,
             "plate_appearances": 0, "at_bats": 0, "hits": 0, "total_bases": 0,
             "home_runs": 0, "batter_strikeouts": 0,
+            "walks_allowed": None, "hits_allowed": None, "runs_allowed": None, "earned_runs": None,
         })
         batter_row["plate_appearances"] += 1
         batter_row["at_bats"] += int(event not in NOT_AB)
@@ -255,6 +387,35 @@ def completed_game_observations(feed, observed_at=None):
         batter_row["total_bases"] += total_base_value.get(event, 0)
         batter_row["home_runs"] += int(event == "home_run")
         batter_row["batter_strikeouts"] += int(event in STRIKEOUTS)
+
+    # Prefer MLB's official box-score pitching line when it is available. The
+    # play-derived counters above remain a fallback for fixtures and old feeds.
+    boxscore = feed.get("liveData", {}).get("boxscore", {}).get("teams", {})
+    for side in ("away", "home"):
+        players = (boxscore.get(side) or {}).get("players", {})
+        for player in players.values() if isinstance(players, dict) else []:
+            person = player.get("person", {}) if isinstance(player, dict) else {}
+            player_id = person.get("id")
+            stats = ((player.get("stats") or {}).get("pitching") or {}) if isinstance(player, dict) else {}
+            row = rows.get((player_id, "pitcher"))
+            if not row or not stats:
+                continue
+            names[player_id] = person.get("fullName") or names.get(player_id)
+            official = {
+                "batters_faced": stats.get("battersFaced"),
+                "strikeouts": stats.get("strikeOuts"),
+                "outs": stats.get("outs"),
+                "pitches": stats.get("numberOfPitches"),
+                "walks_allowed": stats.get("baseOnBalls"),
+                "hits_allowed": stats.get("hits"),
+                "runs_allowed": stats.get("runs"),
+                "earned_runs": stats.get("earnedRuns"),
+            }
+            for key, value in official.items():
+                try:
+                    row[key] = int(value)
+                except (TypeError, ValueError):
+                    pass
     output = []
     for (player_id, role), row in rows.items():
         row["player_name"] = names.get(player_id)
@@ -271,7 +432,8 @@ def save_completed_game_observations(feed, db):
     columns = (
         "game_pk", "game_date", "player_id", "player_name", "team_id", "opponent_id", "role", "is_start",
         "throws", "stands", "batters_faced", "strikeouts", "outs", "pitches", "plate_appearances", "at_bats",
-        "hits", "total_bases", "home_runs", "batter_strikeouts", "observed_at",
+        "hits", "total_bases", "home_runs", "batter_strikeouts", "walks_allowed",
+        "hits_allowed", "runs_allowed", "earned_runs", "observed_at",
     )
     placeholders = ",".join("?" for _ in columns)
     for row in completed_game_observations(feed):
@@ -279,16 +441,38 @@ def save_completed_game_observations(feed, db):
             f"INSERT OR IGNORE INTO player_game_observations({','.join(columns)}, source) VALUES ({placeholders}, 'mlb-gameday')",
             tuple(row[column] for column in columns),
         )
+        if row["role"] == "pitcher":
+            db.execute(
+                """INSERT OR IGNORE INTO pitcher_game_results(
+                     game_pk, player_id, batters_faced, strikeouts, outs, pitches,
+                     walks_allowed, hits_allowed, runs_allowed, earned_runs, observed_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    row["game_pk"], row["player_id"], row["batters_faced"], row["strikeouts"],
+                    row["outs"], row["pitches"], row["walks_allowed"], row["hits_allowed"],
+                    row["runs_allowed"], row["earned_runs"], row["observed_at"],
+                ),
+            )
 
-def process_feed(feed, pitcher_ids, batter_ids, pitcher_data, pitcher_context_data, batter_events, batter_pitch_events, batter_pitch_zones, batter_velocity_events, batter_context_events, batter_quality, pitcher_workloads):
+def process_feed(feed, pitcher_ids, batter_ids, pitcher_data, pitcher_context_data, batter_events, batter_pitch_events, batter_pitch_zones, batter_velocity_events, batter_context_events, batter_quality, pitcher_workloads, batter_discipline=None):
     game_lines = defaultdict(lambda: {"batters_faced": 0, "strikeouts": 0, "outs": 0, "pitches": 0})
     for play in feed.get("liveData", {}).get("plays", {}).get("allPlays", []):
         matchup = play.get("matchup", {})
         pitcher_id = matchup.get("pitcher", {}).get("id")
         batter_id = matchup.get("batter", {}).get("id")
-        pitches = [event for event in play.get("playEvents", []) if event.get("isPitch") and event.get("details", {}).get("type", {}).get("code")]
+        all_pitches = [event for event in play.get("playEvents", []) if event.get("isPitch")]
+        pitches = [event for event in all_pitches if event.get("details", {}).get("type", {}).get("code")]
+        event = play.get("result", {}).get("eventType") or play.get("result", {}).get("event") or ""
+        if batter_discipline is not None and batter_id in batter_ids:
+            discipline = batter_discipline[batter_id]
+            discipline["plate_appearances"] += 1
+            discipline["pitches_seen"] += len(all_pitches)
+            discipline["walks"] += int(event == "walk")
+            discipline["hit_by_pitch"] += int(event == "hit_by_pitch")
+            discipline["hits"] += int(event in HITS)
+            discipline["total_bases"] += {"single": 1, "double": 2, "triple": 3, "home_run": 4}.get(event, 0)
+            discipline["outs"] += int(event in OUTS)
         if pitcher_id in pitcher_ids:
-            event = play.get("result", {}).get("eventType") or play.get("result", {}).get("event") or ""
             if pitches:
                 line = game_lines[pitcher_id]
                 line["batters_faced"] += 1
@@ -302,13 +486,20 @@ def process_feed(feed, pitcher_ids, batter_ids, pitcher_data, pitcher_context_da
                 speed = pitch.get("pitchData", {}).get("startSpeed")
                 try: speed = float(speed)
                 except (TypeError, ValueError): speed = None
-                pitcher_data[pitcher_id][code]["name"] = name
+                pitch_profile = pitcher_data[pitcher_id][code]
+                pitch_profile["name"] = name
+                pitch_profile["swings"] = pitch_profile.get("swings", 0) + int(swung_at_pitch(pitch))
+                pitch_profile["whiffs"] = pitch_profile.get("whiffs", 0) + int(missed_swing(pitch))
+                pitch_profile["chases"] = pitch_profile.get("chases", 0) + int(chased_pitch(pitch))
                 if speed is not None:
                     pitcher_data[pitcher_id][code]["speeds"].append(speed)
                 zone = zone_index(pitch)
                 if zone is not None:
                     pitcher_data[pitcher_id][code]["zones"][zone] += 1
                 pitcher_context_data[pitcher_id][code][count_bucket(pitch)][zone if zone is not None else -1] += 1
+            if pitches and event in STRIKEOUTS:
+                strikeout_profile = pitcher_data[pitcher_id][pitches[-1]["details"]["type"]["code"]]
+                strikeout_profile["strikeouts"] = strikeout_profile.get("strikeouts", 0) + 1
         if batter_id in batter_ids and pitches:
             final_pitch = pitches[-1]
             event = play.get("result", {}).get("eventType") or play.get("result", {}).get("event") or ""
@@ -354,27 +545,35 @@ def sync_game(game_pk, season, workers):
     game_data = target.get("gameData", {})
     probable = game_data.get("probablePitchers", {})
     teams = game_data.get("teams", {})
-    pitcher_ids = {pitcher["id"] for pitcher in probable.values() if pitcher}
-    if len(pitcher_ids) != 2:
+    starter_ids = {pitcher["id"] for pitcher in probable.values() if pitcher}
+    if len(starter_ids) != 2:
         raise ValueError("Both probable starters must be listed before matchup data can be built.")
     home_id, away_id = teams["home"]["id"], teams["away"]["id"]
     batters = active_batters(home_id) | active_batters(away_id)
+    pitcher_rosters = {
+        home_id: active_pitchers(home_id),
+        away_id: active_pitchers(away_id),
+    }
+    profile_pitcher_ids = starter_ids | set(pitcher_rosters[home_id]) | set(pitcher_rosters[away_id])
     target_date = game_data.get("datetime", {}).get("officialDate") or datetime.now(timezone.utc).date().isoformat()
     historical_end = (datetime.fromisoformat(target_date).date() - timedelta(days=1)).isoformat()
     game_ids = set(completed_team_games(home_id, season, historical_end)) | set(completed_team_games(away_id, season, historical_end))
+    game_ids.update(completed_team_games_on_date(home_id, target_date))
+    game_ids.update(completed_team_games_on_date(away_id, target_date))
     game_ids.discard(game_pk)
     # Team schedules are fast, while player logs preserve pre-trade history.
     with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
         history_futures = {
-            executor.submit(player_game_logs, player_id, season, "pitching" if player_id in pitcher_ids else "hitting", target_date): player_id
-            for player_id in pitcher_ids | set(batters)
+            executor.submit(player_game_logs, player_id, season, "pitching" if player_id in starter_ids else "hitting", target_date): player_id
+            for player_id in starter_ids | set(batters)
         }
         for future in as_completed(history_futures):
             try:
                 game_ids.update(future.result())
             except Exception as error:
                 print(f"Player history {history_futures[future]} unavailable: {str(error)[:100]}")
-    print(f"Game {game_pk}: reading {len(game_ids)} completed feeds for {len(batters)} active hitters and two probable starters…")
+    bullpen_count = len(profile_pitcher_ids - starter_ids)
+    print(f"Game {game_pk}: reading {len(game_ids)} completed feeds for {len(batters)} active hitters, two starters, and {bullpen_count} bullpen candidates…")
     feeds, failures = [], []
     with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
         futures = {executor.submit(cached_feed, completed_game_pk): completed_game_pk for completed_game_pk in game_ids}
@@ -382,7 +581,7 @@ def sync_game(game_pk, season, workers):
             completed_game_pk = futures[future]
             try: feeds.append(future.result())
             except Exception as error: failures.append(f"{completed_game_pk}: {error}")
-    pitcher_data = defaultdict(lambda: defaultdict(lambda: {"name": "Pitch", "speeds": [], "zones": [0] * 9}))
+    pitcher_data = defaultdict(lambda: defaultdict(pitcher_pitch_record))
     pitcher_context_data = defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(int))))
     batter_events = defaultdict(list)
     batter_pitch_events = defaultdict(lambda: defaultdict(list))
@@ -390,18 +589,19 @@ def sync_game(game_pk, season, workers):
     batter_velocity_events = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
     batter_context_events = batter_context_store()
     batter_quality = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
+    batter_discipline = defaultdict(batter_discipline_record)
     pitcher_workloads = defaultdict(list)
     for feed in feeds:
-        process_feed(feed, pitcher_ids, batters, pitcher_data, pitcher_context_data, batter_events, batter_pitch_events, batter_pitch_zones, batter_velocity_events, batter_context_events, batter_quality, pitcher_workloads)
+        process_feed(feed, profile_pitcher_ids, batters, pitcher_data, pitcher_context_data, batter_events, batter_pitch_events, batter_pitch_zones, batter_velocity_events, batter_context_events, batter_quality, pitcher_workloads, batter_discipline)
     # A probable starter can have no 2026 pitch history (injury, rookie, or a
     # future game-date). Use only that pitcher's actual prior-season game logs
     # as a transparent fallback instead of dropping the whole matchup.
     fallback_data, fallback_failures = {}, []
-    missing_pitchers = [pitcher_id for pitcher_id in pitcher_ids if not pitcher_data[pitcher_id]]
+    missing_pitchers = [pitcher_id for pitcher_id in starter_ids if not pitcher_data[pitcher_id]]
     for pitcher_id in missing_pitchers:
         try:
             prior_pks = pitcher_game_logs(pitcher_id, season - 1)
-            prior_data = defaultdict(lambda: defaultdict(lambda: {"name": "Pitch", "speeds": [], "zones": [0] * 9}))
+            prior_data = defaultdict(lambda: defaultdict(pitcher_pitch_record))
             prior_context_data = defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(int))))
             with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
                 prior_feeds = list(executor.map(cached_feed, prior_pks))
@@ -416,7 +616,11 @@ def sync_game(game_pk, season, workers):
     with connect() as db:
         for completed_feed in feeds:
             save_completed_game_observations(completed_feed, db)
-        for pitcher_id in pitcher_ids:
+        for pitcher_id in profile_pitcher_ids:
+            # Missing reliever history stays unknown; do not erase a prior saved
+            # profile merely because a newly acquired pitcher has no team feed yet.
+            if not pitcher_data[pitcher_id] and pitcher_id not in fallback_data:
+                continue
             db.execute("DELETE FROM gameday_pitcher_arsenal WHERE player_id=?", (pitcher_id,))
             source_season = season if pitcher_data[pitcher_id] else season - 1
             pitches = pitcher_data[pitcher_id] or fallback_data.get(pitcher_id, {}).get("arsenal", {})
@@ -425,7 +629,18 @@ def sync_game(game_pk, season, workers):
             for code, value in pitches.items():
                 count = len(value["speeds"])
                 if not count: continue
-                db.execute("INSERT INTO gameday_pitcher_arsenal VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (source_season, pitcher_id, code, value["name"], count, round(count / total * 100, 1), round(sum(value["speeds"]) / count, 1), json.dumps(value["zones"])))
+                db.execute(
+                    """INSERT INTO gameday_pitcher_arsenal(
+                         season, player_id, pitch_code, pitch_name, pitches, usage, velo, zones,
+                         swings, whiffs, chases, strikeouts
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        source_season, pitcher_id, code, value["name"], count,
+                        round(count / total * 100, 1), round(sum(value["speeds"]) / count, 1),
+                        json.dumps(value["zones"]), value.get("swings", 0), value.get("whiffs", 0),
+                        value.get("chases", 0), value.get("strikeouts", 0),
+                    ),
+                )
             db.execute("DELETE FROM gameday_pitcher_arsenal_context WHERE player_id=?", (pitcher_id,))
             for code, count_rows in contexts.items():
                 for context_count, zones in count_rows.items():
@@ -451,8 +666,22 @@ def sync_game(game_pk, season, workers):
             db.execute("DELETE FROM gameday_batter_pitch_quality WHERE season=? AND player_id=?", (season, batter_id))
             for code, quality in batter_quality[batter_id].items():
                 db.execute("INSERT INTO gameday_batter_pitch_quality VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (season, batter_id, code, quality["pitches"], quality["swings"], quality["whiffs"], quality["chase_swings"], quality["batted_balls"], quality["hard_hits"], quality["barrel_proxy"], quality["strikeouts"]))
-        for pitcher_id in pitcher_ids:
+            discipline = batter_discipline[batter_id]
+            db.execute(
+                """INSERT OR REPLACE INTO gameday_batter_discipline(
+                     season, player_id, plate_appearances, pitches_seen, walks,
+                     hit_by_pitch, hits, total_bases, outs
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    season, batter_id, discipline["plate_appearances"], discipline["pitches_seen"],
+                    discipline["walks"], discipline["hit_by_pitch"], discipline["hits"],
+                    discipline["total_bases"], discipline["outs"],
+                ),
+            )
+        for pitcher_id in profile_pitcher_ids:
             lines = sorted(pitcher_workloads[pitcher_id], key=lambda line: line["date"])
+            if not lines:
+                continue
             recent = lines[-3:]
             totals = {key: sum(line[key] for line in lines) for key in ("batters_faced", "strikeouts", "outs", "pitches")}
             recent_totals = {key: sum(line[key] for line in recent) for key in ("batters_faced", "strikeouts", "outs", "pitches")}
@@ -484,8 +713,21 @@ def sync_game(game_pk, season, workers):
     scheduled_start = game_data.get("datetime", {}).get("dateTime")
     if is_before_start(recorded_at, scheduled_start):
         record_pregame_snapshot(game_pk, recorded_at, scheduled_start, probable, snapshot_lineups)
+        bullpen_by_side = {}
+        with connect() as db:
+            for side, team_id in (("away", away_id), ("home", home_id)):
+                starter_id = (probable.get(side) or {}).get("id")
+                bullpen_by_side[side] = bullpen_snapshot_rows(
+                    db, pitcher_rosters[team_id], starter_id, team_id, target_date,
+                )
+        for side, team_id in (("away", away_id), ("home", home_id)):
+            record_bullpen_snapshot(
+                game_pk, team_id, teams.get(side, {}).get("name", "Team"),
+                scheduled_start, recorded_at, bullpen_by_side[side],
+            )
     fallback_count = len(fallback_data)
-    print(f"Game {game_pk}: saved {sum(len(x) for x in pitcher_data.values()) + sum(len(x) for x in fallback_data.values())} arsenal pitches from {len(feeds)} completed games.")
+    saved_pitchers = sum(bool(value) for value in pitcher_data.values()) + len(fallback_data)
+    print(f"Game {game_pk}: saved {saved_pitchers} pitcher profiles from {len(feeds)} completed games.")
     if fallback_count: print(f"Game {game_pk}: used prior-season pitch history for {fallback_count} starter(s).")
     if failures: print(f"{len(failures)} game feeds failed; rerun safely to retry them.")
 

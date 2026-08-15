@@ -1,8 +1,8 @@
 # Diamond Intel model card
 
-## Pitcher strikeouts: `pitcher-k-eb-v2`
+## Pitcher strikeouts: `pitcher-k-workload-v4`
 
-Feature version: `gameday-features-v2`
+Feature version: `gameday-features-v4`
 
 Status: unvalidated research baseline. It is not approved to emit a bet recommendation or claim profitability.
 
@@ -18,12 +18,15 @@ All game observations must have `game_date < target officialDate`, and every sav
 
 - Pitcher strikeouts per batter faced use a beta-binomial posterior with an 80-BF league prior.
 - Recent performance contributes at one-quarter weight and is still shrunk.
-- Confirmed lineup K susceptibility uses each hitter's broader final-pitch PA history against the probable starter's throwing hand, with a 120-PA league K% prior and lineup-order weights.
-- Batter/pitch-type strikeout evidence uses a 60-PA prior per pitch as a smaller pitch-mix refinement, rather than the primary matchup gate.
+- Confirmed lineup K susceptibility uses each hitter's broader final-pitch PA history against the probable starter's throwing hand, with a 120-PA league K% prior, lineup-order weights, and an evidence-coverage weight.
+- Batter/pitch-type strikeout evidence uses a 60-PA prior per pitch and is capped at a 1.2 percentage-point adjustment because this sparse feature was too influential before settled calibration data existed.
 - Missing arsenal evidence retains the pitcher posterior instead of being discarded and renormalized.
-- Expected batters faced prefers start-only player-game observations and shrinks toward 22 BF per start. Until those rows are populated, an explicitly labeled mixed-role aggregate fallback is used.
-- Game strikeouts use a negative-binomial distribution with dispersion 12. The backtest reports an out-of-sample Poisson comparison; the distribution choice must be revisited when enough settled predictions exist.
-- Raw umpire outcome rates, park geometry, weather, and game moneyline are not numerical adjustments in v1 because their effects have not been calibrated here.
+- Workload begins with a start-only pitch-budget prior. Confirmed-lineup pitches per PA, on-base proxy, total bases per PA, and out rate are shrunk with 120-PA league priors and lineup-order weighted.
+- The free ESPN game total and moneyline contribute a capped team-run context. Opponent patience, traffic, power, and run context adjust early-hook risk and the available pitch budget; every intermediate value is displayed.
+- Expected BF is 80% opponent-adjusted pitch budget divided by matchup pitches per batter and 20% historical BF stabilization. Expected outs use the opponent-adjusted out rate. A timestamped manual pitch cap can lower, but never raise, the model pitch budget.
+- Until start-only and batter-discipline rows are populated, explicitly labeled aggregate or league-prior fallbacks are used.
+- Game strikeouts mix a workload distribution with Beta-binomial K-rate uncertainty. Workload, pitch-count, outs, and K-rate error are evaluated separately once final MLB results arrive.
+- Raw umpire outcome rates, park geometry, and weather are not numerical adjustments in v4 because their effects have not been calibrated here.
 
 ### Confidence
 
@@ -31,7 +34,7 @@ The dashboard reports a separate A–D data grade. A requires a confirmed lineup
 
 ### Training and evaluation
 
-No fitted training optimization is performed in v1. Priors are conservative documented assumptions. Evaluation is chronological over immutable predictions and includes count error, calibration, distribution comparison, rolling baselines, market baselines, price-aware ROI, and same-line CLV.
+No fitted training optimization is performed in v4. Priors and adjustment caps are conservative documented assumptions. Evaluation is chronological over immutable predictions and includes count error, calibration, distribution comparison, rolling baselines, market baselines, price-aware ROI, and same-line CLV.
 
 Current settled out-of-sample sample size: 0 at release. Calibration, ROI, and CLV are therefore unavailable. The decision system remains locked to research-only states.
 
@@ -45,14 +48,16 @@ Do not enable a `BET` state merely because historical ROI is positive. At minimu
 - The legacy aggregate fallback can mix starts and relief appearances until observation history is populated.
 - Pitch-type PA attribution uses the final pitch and is descriptive rather than causal.
 - The K-opportunity label is a descriptive matchup environment based on projected Ks, K rate, and starter workload; it is not a probability of beating a prop line.
-- Starter-leash labels are descriptive comparisons of recent versus season batters faced and pitch counts; they are not an independently calibrated injury, coach, or pitch-limit forecast.
+- Workload matchup adjustments are transparent heuristics, not a fitted survival model. They do not know unreported injuries, bullpen availability, or manager intent.
+- A manual pitch cap is user-supplied scenario context. It must represent an informed restriction and cannot increase the model's historical pitch budget.
 - Hitter pitch cells select historical results against the probable starter's throwing hand and reweight them to that starter's coarse count state (pitcher ahead/even/hitter ahead) and 3×3 strike-zone mix. Those cells are sparse and use a 20-AB prior back to the hitter's broader same-pitch, same-velocity sample; they are descriptive, not causal.
 - Hitter pitch cells report descriptive AVG, SLG, ISO, and XBH from final-pitch outcomes. They are not player-prop probabilities or projected game totals.
 - When ESPN publishes it, the game total supplies a capped ±3.5-point run-environment adjustment to the hitter fit, and the listed moneyline favorite receives a 1.5-point team-scoring-context adjustment. These are transparent ranking context, not calibrated hit/total-base probabilities; absent markets add zero.
-- Bullpen exposure is not modeled for hitter props.
+- Hitter research estimates starter plate appearances from batting order and the starter's projected batters-faced distribution, then assigns the remaining expected appearances to a readiness/role-weighted relief mix. Each reliever is evaluated with the same pitch-type, velocity, handedness, count, and zone framework as the starter. Missing reliever arsenal mass is retained as league-average uncertainty rather than redistributed to known pitchers. This is descriptive full-game research, not a calibrated hitter-prop forecast.
+- Bullpen readiness uses recent pitches and consecutive-day use. It does not observe warmups, injuries, transactions after capture, or manager intent, so it must never be read as confirmed availability.
 - Park, weather, and umpire inputs are descriptive, not calibrated adjustments.
 - Public feeds and manually imported markets may be delayed, incomplete, or incorrect.
-- Negative-binomial dispersion is provisional until evaluated on a sufficient walk-forward sample.
+- Beta-binomial rate uncertainty and the workload mixture remain provisional until evaluated on a sufficient walk-forward sample.
 
 ### Unsupported uses
 

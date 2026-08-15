@@ -79,12 +79,20 @@ class DashboardSpotlightTests(unittest.TestCase):
         self.assertIn("performance-label", self.page)
 
     def test_pitcher_board_shows_opportunity_and_the_projection_pathway(self):
-        self.assertIn("K opportunity", self.page)
+        self.assertIn("K environment", self.page)
         self.assertIn("Data grade", self.page)
         self.assertIn("Projection pathway", self.page)
         self.assertIn("Confirmed-lineup K risk", self.page)
         self.assertIn("Starter leash", self.page)
         self.assertIn("K risk", self.page)
+
+    def test_matchup_adjusted_workload_pathway_and_manual_cap_are_visible(self):
+        self.assertIn("Why ${Number(p.expected_batters_faced).toFixed(1)} expected BF?", self.page)
+        self.assertIn("Lineup patience", self.page)
+        self.assertIn("Matchup early-hook adjustment", self.page)
+        self.assertIn("80% matchup pitch-budget conversion", self.page)
+        self.assertIn("Manual pitch cap", self.page)
+        self.assertIn("/api/workload-overrides", self.page)
 
     def test_game_total_and_favorite_are_visible_in_research(self):
         self.assertIn("Game total", self.page)
@@ -103,6 +111,24 @@ class DashboardSpotlightTests(unittest.TestCase):
         self.assertIn("opportunity.drivers", self.page)
         self.assertIn("Risk:", self.page)
         self.assertIn("not calibrated prop probabilities", self.page)
+
+    def test_batter_spotlight_lists_every_strong_matchup_for_selected_outcome(self):
+        self.assertIn('id="allStrongBatterRows"', self.page)
+        self.assertIn('id="allStrongBatterTitle"', self.page)
+        self.assertIn("strongBatters=qualifiedBatters.filter(item=>item.opportunity.tier==='strong')", self.page)
+        self.assertIn("strongBatters.map", self.page)
+        self.assertNotIn("strongBatters.slice", self.page)
+        self.assertIn("No upcoming confirmed-lineup batters have a strong matchup for this outcome yet.", self.page)
+
+    def test_bullpen_readiness_and_full_game_hitter_blend_are_visible(self):
+        self.assertIn("Estimated bullpen readiness", self.page)
+        self.assertIn("Likely fresh", self.page)
+        self.assertIn("Recent pitches: today", self.page)
+        self.assertIn("Hitter fit versus this reliever", self.page)
+        self.assertIn("full_game_research||batter.arsenal_research", self.page)
+        self.assertIn("Full-game matchup & exposure", self.page)
+        self.assertIn("Starter pitch cells remain starter-only", self.page)
+        self.assertIn("bullpen_effect", self.page)
 
 
 if __name__ == "__main__":
