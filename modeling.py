@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 from math import erf, exp, floor, isfinite, lgamma, log, sqrt
 from statistics import median
 
+from pitcher_ml import shadow_workload_prediction
+
 MODEL_VERSION = "pitcher-k-workload-v4"
 FEATURE_VERSION = "gameday-features-v4"
 LEAGUE_K_RATE = 0.225
@@ -20,11 +22,25 @@ LEAGUE_HITTER_HR_RATE = 0.030
 LEAGUE_HARD_HIT_RATE = 0.390
 LEAGUE_BARREL_PROXY_RATE = 0.075
 HITTER_PITCH_PRIOR_PA = 60.0
+HITTER_PLATOON_PRIOR_PA = 80.0
 HITTER_PITCH_MIN_PA = 10.0
+HITTER_PITCH_MIN_RELIABILITY = 0.25
 HITTER_CONTACT_DELTA = 0.025
 HITTER_CONTACT_FAVORABLE_DELTA = 0.012
 HITTER_ARSENAL_MIN_COVERAGE = 0.35
 HITTER_ARSENAL_MIN_EFFECTIVE_PA = 10.0
+# Full-game coverage is deliberately diluted by unmodeled arsenal mass and the
+# reliever blend. Count/zone coverage is an even narrower exact-context
+# intersection, so it naturally lives in the low single digits. These gates
+# identify the top evidence tail without requiring impossible percentages.
+HITTER_STRONG_MIN_COVERAGE = 0.35
+HITTER_STRONG_MIN_EFFECTIVE_PA = 30.0
+HITTER_STRONG_MIN_CONTEXT_COVERAGE = 0.03
+HITTER_RISK_MIN_COVERAGE = 0.15
+HITTER_RISK_MIN_EFFECTIVE_PA = 10.0
+HITTER_RISK_MIN_CONTEXT_COVERAGE = 0.02
+HITTER_RISK_MIN_PLATOON_AB = 50
+HITTER_RISK_MIN_SEASON_PA = 100
 LEAGUE_GAME_TOTAL = 8.5
 LEAGUE_PITCHES_PER_PA = 3.9
 LEAGUE_ON_BASE_PROXY = 0.320
@@ -804,6 +820,33 @@ def pitcher_k_projection(side, market=None, as_of=None, scheduled_start=None):
     distribution = workload_k_distribution(
         k_rate, expected_bf, bf_low, bf_high, line, rate_strength=rate_strength,
     )
+    try:
+        workload_challenger = shadow_workload_prediction(side)
+    except (KeyError, TypeError, ValueError, OSError) as error:
+        workload_challenger = {
+            "available": False, "status": "unavailable",
+            "message": f"Workload challenger unavailable: {error}",
+        }
+    k_challenger = {"available": False, "status": workload_challenger.get("status", "collecting")}
+    if workload_challenger.get("available"):
+        ml_bf = workload_challenger["expected_batters_faced"]
+        ml_low, ml_high = workload_challenger["batters_faced_interval"]
+        ml_distribution = workload_k_distribution(
+            k_rate, ml_bf, ml_low, ml_high, line, rate_strength=rate_strength,
+        )
+        k_challenger = {
+            "available": True, "status": "shadow",
+            "projection": k_rate * ml_bf,
+            "median": ml_distribution["median"],
+            "interval_low": ml_distribution["interval_low"],
+            "interval_high": ml_distribution["interval_high"],
+            "probability_over": ml_distribution.get("probability_over"),
+            "probability_under": ml_distribution.get("probability_under"),
+            "probability_push": ml_distribution.get("probability_push"),
+            "milestone_probabilities": ml_distribution["milestones"],
+            "distribution": ml_distribution["distribution"],
+            "note": "Uses the shadow ML workload with the same transparent matchup K rate.",
+        }
     market_read = evaluate_market(distribution, market)
     lineup_confirmed = side.get("lineup_confirmed") is True
     data_freshness_seconds = _number(side.get("data_freshness_seconds"))
@@ -899,6 +942,8 @@ def pitcher_k_projection(side, market=None, as_of=None, scheduled_start=None):
         "opportunity": opportunity,
         "workload_read": leash,
         "performance_outlook": performance_outlook,
+        "workload_challenger": workload_challenger,
+        "k_challenger": k_challenger,
         "workload_stages": workload_estimate["workload_stages"],
         "lineup_workload_context": workload_estimate["lineup_workload_context"],
         "components": {
@@ -926,27 +971,33 @@ def pitcher_k_projection(side, market=None, as_of=None, scheduled_start=None):
     }
 
 
-def hitter_pitch_summary(stat, league_average=LEAGUE_HITTER_AVERAGE):
+def hitter_pitch_summary(stat, league_average=LEAGUE_HITTER_AVERAGE, prior=None):
     """Return a context-aware, shrinkage-safe contact and power read."""
     stat = stat or {}
+    prior = prior or {}
+    prior_average = clamp(_number(prior.get("avg"), league_average), 0.0, 1.0)
+    prior_slg = max(0.0, _number(prior.get("slg"), LEAGUE_HITTER_SLG))
+    prior_iso = max(0.0, _number(prior.get("iso"), prior_slg - prior_average))
     pa = max(0.0, _number(stat.get("pa"), 0.0))
     context = stat.get("context") or {}
-    average = clamp(_number(context.get("adjusted_avg"), _number(stat.get("avg"), league_average)), 0.0, 1.0)
+    average = clamp(_number(context.get("adjusted_avg"), _number(stat.get("avg"), prior_average)), 0.0, 1.0)
     advanced = stat.get("advanced") or {}
     power_value = _number(context.get("adjusted_slg"), _number(advanced.get("slg")))
     has_power = power_value is not None
     slugging = max(0.0, power_value if has_power else LEAGUE_HITTER_SLG)
     approximate_hits = average * pa
-    posterior = shrunk_rate(approximate_hits, pa, league_average, HITTER_PITCH_PRIOR_PA)
+    posterior = shrunk_rate(approximate_hits, pa, prior_average, HITTER_PITCH_PRIOR_PA)
     reliability = pa / (pa + HITTER_PITCH_PRIOR_PA) if pa else 0.0
-    slugging_posterior = (slugging * pa + LEAGUE_HITTER_SLG * HITTER_PITCH_PRIOR_PA) / (pa + HITTER_PITCH_PRIOR_PA) if pa else LEAGUE_HITTER_SLG
-    iso_posterior = max(0.0, slugging_posterior - posterior) if has_power else LEAGUE_HITTER_ISO
+    slugging_posterior = (slugging * pa + prior_slg * HITTER_PITCH_PRIOR_PA) / (pa + HITTER_PITCH_PRIOR_PA) if pa else prior_slg
+    iso_posterior = max(0.0, slugging_posterior - posterior) if has_power else prior_iso
     avg_delta = posterior - league_average
     iso_delta = iso_posterior - LEAGUE_HITTER_ISO
     delta = .70 * avg_delta + .30 * iso_delta
     context_coverage = clamp(_number(context.get("coverage"), 0.0), 0.0, 1.0)
     if pa < HITTER_PITCH_MIN_PA:
         label, tone = "low data", "neutral"
+    elif reliability < HITTER_PITCH_MIN_RELIABILITY:
+        label, tone = "prior-driven", "neutral"
     elif delta >= HITTER_CONTACT_DELTA:
         label, tone = "favorable", "good"
     elif delta <= -HITTER_CONTACT_DELTA:
@@ -965,6 +1016,79 @@ def hitter_pitch_summary(stat, league_average=LEAGUE_HITTER_AVERAGE):
         "reliability": reliability,
         "context_coverage": context_coverage,
         "pa": pa,
+        "prior_average": prior_average,
+        "prior_slg": prior_slg,
+    }
+
+
+def hitter_strong_evidence(metrics):
+    """Return whether a hitter read clears the high-confidence evidence gate."""
+    return (
+        _number(metrics.get("coverage"), 0.0) >= HITTER_STRONG_MIN_COVERAGE
+        and _number(metrics.get("effective_sample_size"), 0.0) >= HITTER_STRONG_MIN_EFFECTIVE_PA
+        and _number(metrics.get("context_coverage"), 0.0) >= HITTER_STRONG_MIN_CONTEXT_COVERAGE
+    )
+
+
+def hitter_signal_risk(batter, metrics):
+    """Describe when an attractive hitter point estimate is too unstable to trust.
+
+    Matchup direction and evidence stability are intentionally separate. A high
+    score can still be labeled high risk when it rests on sparse pitch,
+    handedness, season, or exact-context evidence.
+    """
+    coverage = clamp(_number(metrics.get("coverage"), 0.0), 0.0, 1.0)
+    sample = max(0.0, _number(metrics.get("effective_sample_size"), 0.0))
+    context_coverage = clamp(_number(metrics.get("context_coverage"), 0.0), 0.0, 1.0)
+    platoon = metrics.get("platoon") or batter.get("platoon") or {}
+    season = batter.get("season") or {}
+    platoon_ab = _number(platoon.get("at_bats"))
+    season_pa = _number(season.get("pa"))
+    reasons = []
+    instability_flags = []
+
+    def flag(key, reason):
+        instability_flags.append(key)
+        reasons.append(reason)
+
+    if coverage < HITTER_RISK_MIN_COVERAGE:
+        flag("arsenal_coverage", f"Only {coverage:.0%} arsenal coverage")
+    if sample < HITTER_RISK_MIN_EFFECTIVE_PA:
+        flag("effective_pa", f"Only {sample:.1f} effective PA")
+    if context_coverage < HITTER_RISK_MIN_CONTEXT_COVERAGE:
+        flag("context_coverage", f"Only {context_coverage:.0%} exact-context coverage")
+    if platoon_ab is not None and platoon_ab < HITTER_RISK_MIN_PLATOON_AB:
+        flag("platoon_sample", f"Only {platoon_ab:.0f} AB in the {platoon.get('label', 'handedness')} split")
+    if season_pa is not None and season_pa < HITTER_RISK_MIN_SEASON_PA:
+        flag("season_sample", f"Only {season_pa:.0f} current-season PA")
+    if metrics.get("platoon_disagreement"):
+        flag("platoon_disagreement", "Pitch-fit estimate conflicts with the stable platoon baseline")
+
+    critical = (
+        coverage < 0.10
+        or sample < 5.0
+        or (platoon_ab is not None and platoon_ab < 25)
+        or (season_pa is not None and season_pa < 60)
+        or bool(metrics.get("platoon_disagreement"))
+    )
+    if critical or len(instability_flags) >= 2:
+        level, label = "high", "High risk"
+    elif instability_flags:
+        level, label = "elevated", "Elevated risk"
+    else:
+        level, label = "normal", "Standard risk"
+
+    if not batter.get("lineup_order"):
+        reasons.append("Starting lineup is not confirmed")
+    bullpen_effect = metrics.get("bullpen_effect") or {}
+    if bullpen_effect.get("key") in {"uncertain", "unknown"}:
+        reasons.append(bullpen_effect.get("label") or "Bullpen uncertainty")
+
+    return {
+        "level": level,
+        "label": label,
+        "reasons": list(dict.fromkeys(reasons))[:6],
+        "flags": instability_flags,
     }
 
 
@@ -1054,18 +1178,25 @@ def hitter_opportunity_reads(batter, metrics, market_context):
         base_risks.append("Lower-order plate-appearance risk")
     if k_rate >= 0.26:
         base_risks.append(f"Elevated {k_rate:.1%} descriptive K rate")
+    platoon = metrics.get("platoon") or {}
+    if metrics.get("platoon_disagreement"):
+        base_risks.append(
+            f"Pitch-fit estimate disagrees with the {_number(platoon.get('at_bats'), 0):.0f}-AB "
+            f"{platoon.get('label', 'platoon')} baseline"
+        )
 
-    if coverage >= 0.55 and sample >= 25 and context_coverage >= 0.20:
+    if hitter_strong_evidence(metrics):
         evidence = "strong"
     elif coverage >= HITTER_ARSENAL_MIN_COVERAGE and sample >= HITTER_ARSENAL_MIN_EFFECTIVE_PA:
         evidence = "usable"
     else:
         evidence = "limited"
+    signal_risk = hitter_signal_risk(batter, metrics)
 
     def build(key, title, score, value, drivers, extra_risks=()):
         if evidence == "limited":
             tier, tone = "watchlist", "neutral"
-        elif score >= 0.75:
+        elif score >= 0.75 and evidence == "strong":
             tier, tone = "strong", "good"
         elif score >= 0.25:
             tier, tone = "favorable", "good"
@@ -1124,7 +1255,12 @@ def hitter_opportunity_reads(batter, metrics, market_context):
         [f"Best path: {primary['title']}", *primary["drivers"][:2]],
         primary["risks"],
     )
-    return {"primary": primary_key, "projected_pa": projected_pa, "items": opportunities}
+    return {
+        "primary": primary_key,
+        "projected_pa": projected_pa,
+        "items": opportunities,
+        "risk": signal_risk,
+    }
 
 
 def hitter_arsenal_summary(batter, pitches, league_average=LEAGUE_HITTER_AVERAGE, market_context=None):
@@ -1136,16 +1272,23 @@ def hitter_arsenal_summary(batter, pitches, league_average=LEAGUE_HITTER_AVERAGE
     """
     total_usage = sum(max(0.0, _number(p.get("usage"), 0.0)) for p in pitches)
     market_context = market_context or hitter_market_context(None, None)
+    platoon = batter.get("platoon") or {}
+    platoon_prior = {
+        "avg": _number(platoon.get("posterior_avg"), league_average),
+        "slg": _number(platoon.get("posterior_slg"), LEAGUE_HITTER_SLG),
+        "iso": _number(platoon.get("posterior_iso"), LEAGUE_HITTER_ISO),
+    }
     if total_usage <= 0:
-        empty = {"label": "insufficient", "tier": "watchlist", "tone": "neutral", "coverage": 0.0, "effective_sample_size": 0.0, "expected_average": league_average, "expected_slg": LEAGUE_HITTER_SLG, "expected_iso": LEAGUE_HITTER_ISO, "delta": 0.0, "base_score": 0.0, "score": market_context["adjustment"], "market_context": market_context, "context_coverage": 0.0, "quality_coverage": 0.0, "hard_hit_rate": LEAGUE_HARD_HIT_RATE, "barrel_rate": LEAGUE_BARREL_PROXY_RATE, "hr_rate": LEAGUE_HITTER_HR_RATE}
+        empty = {"label": "insufficient", "tier": "watchlist", "tone": "neutral", "coverage": 0.0, "effective_sample_size": 0.0, "expected_average": platoon_prior["avg"], "expected_slg": platoon_prior["slg"], "expected_iso": platoon_prior["iso"], "delta": platoon_prior["avg"] - league_average, "base_score": 0.0, "score": market_context["adjustment"], "market_context": market_context, "context_coverage": 0.0, "quality_coverage": 0.0, "hard_hit_rate": LEAGUE_HARD_HIT_RATE, "barrel_rate": LEAGUE_BARREL_PROXY_RATE, "hr_rate": LEAGUE_HITTER_HR_RATE, "platoon": platoon}
         empty["opportunities"] = hitter_opportunity_reads(batter, empty, market_context)
+        empty["risk"] = empty["opportunities"]["risk"]
         return empty
     expected = expected_slg = expected_iso = coverage = context_coverage = sample = score = 0.0
     hard_hit_rate = barrel_rate = hr_rate = quality_coverage = 0.0
     for pitch in pitches:
         usage = max(0.0, _number(pitch.get("usage"), 0.0)) / total_usage
         stat = (batter.get("vs_pitches") or {}).get(pitch.get("code"))
-        pitch_read = hitter_pitch_summary(stat, league_average)
+        pitch_read = hitter_pitch_summary(stat, league_average, platoon_prior)
         pa = pitch_read["pa"]
         posterior = pitch_read["shrunk_average"]
         slg_posterior = pitch_read["shrunk_slg"]
@@ -1171,9 +1314,19 @@ def hitter_arsenal_summary(batter, pitches, league_average=LEAGUE_HITTER_AVERAGE
     delta = expected - league_average
     base_score = score
     score = base_score + market_context["adjustment"]
+    strong_evidence = hitter_strong_evidence({
+        "coverage": coverage,
+        "effective_sample_size": sample,
+        "context_coverage": context_coverage,
+    })
+    platoon_ab = max(0.0, _number(platoon.get("at_bats"), 0.0))
+    platoon_disagreement = (
+        platoon_ab >= 100
+        and abs(expected - _number(platoon.get("raw_avg"), expected)) >= 0.040
+    )
     if coverage < HITTER_ARSENAL_MIN_COVERAGE or sample < HITTER_ARSENAL_MIN_EFFECTIVE_PA:
         label, tier, tone = "insufficient", "watchlist", "neutral"
-    elif score >= HITTER_CONTACT_DELTA:
+    elif score >= HITTER_CONTACT_DELTA and strong_evidence and not platoon_disagreement:
         label, tier, tone = "strong contact research", "strong", "good"
     elif score >= HITTER_CONTACT_FAVORABLE_DELTA:
         label, tier, tone = "favorable contact research", "favorable", "good"
@@ -1199,8 +1352,12 @@ def hitter_arsenal_summary(batter, pitches, league_average=LEAGUE_HITTER_AVERAGE
         "hard_hit_rate": hard_hit_rate,
         "barrel_rate": barrel_rate,
         "hr_rate": hr_rate,
+        "platoon": platoon,
+        "platoon_disagreement": platoon_disagreement,
+        "strong_evidence": strong_evidence,
     }
     result["opportunities"] = hitter_opportunity_reads(batter, result, market_context)
+    result["risk"] = result["opportunities"]["risk"]
     return result
 
 
@@ -1287,9 +1444,12 @@ def blend_full_game_hitter_matchup(batter, starter_summary, bullpen_entries,
     result["k_rate"] = starter_share * starter_k_rate + bullpen_share * bullpen_k_rate
     result["score"] = result["base_score"] + _number(market_context.get("adjustment"), 0.0)
     result["market_context"] = market_context
+    result["platoon"] = starter.get("platoon") or batter.get("platoon") or {}
+    result["platoon_disagreement"] = bool(starter.get("platoon_disagreement"))
+    result["strong_evidence"] = hitter_strong_evidence(result)
     if result["coverage"] < HITTER_ARSENAL_MIN_COVERAGE or result["effective_sample_size"] < HITTER_ARSENAL_MIN_EFFECTIVE_PA:
         result.update({"label": "insufficient", "tier": "watchlist", "tone": "neutral"})
-    elif result["score"] >= HITTER_CONTACT_DELTA:
+    elif result["score"] >= HITTER_CONTACT_DELTA and result["strong_evidence"] and not result["platoon_disagreement"]:
         result.update({"label": "strong full-game research", "tier": "strong", "tone": "good"})
     elif result["score"] >= HITTER_CONTACT_FAVORABLE_DELTA:
         result.update({"label": "favorable full-game research", "tier": "favorable", "tone": "good"})
@@ -1356,4 +1516,6 @@ def blend_full_game_hitter_matchup(batter, starter_summary, bullpen_entries,
         "label": effect_label,
         "opportunity_delta": round(opportunity_delta, 3),
     }
+    result["risk"] = hitter_signal_risk(batter, result)
+    result["opportunities"]["risk"] = result["risk"]
     return result

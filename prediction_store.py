@@ -72,6 +72,61 @@ def record_pregame_snapshot(game_pk, captured_at, scheduled_start, probable, lin
         return cursor.lastrowid
 
 
+def record_ml_feature_snapshot(game_pk, captured_at, scheduled_start, player_id,
+                               player_name, target, model_version,
+                               feature_version, features, lineup_confirmed=False,
+                               source="diamond-intel-pregame", db_path=None):
+    """Save the first reproducible pregame feature vector for a player/game.
+
+    Browser refreshes are intentionally idempotent: the earliest snapshot for
+    a model feature version wins and can never be edited after first pitch.
+    """
+    if not is_before_start(captured_at, scheduled_start):
+        return None
+    with connect(db_path) as db:
+        cursor = db.execute(
+            """INSERT OR IGNORE INTO ml_feature_snapshots(
+                 captured_at, scheduled_start, game_pk, player_id, player_name,
+                 target, model_version, feature_version, lineup_confirmed,
+                 features_json, source
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                captured_at, scheduled_start, int(game_pk), int(player_id),
+                player_name, target, model_version, feature_version,
+                int(bool(lineup_confirmed)), json.dumps(features, sort_keys=True),
+                source,
+            ),
+        )
+        if cursor.rowcount:
+            return cursor.lastrowid
+        row = db.execute(
+            """SELECT ml_snapshot_id FROM ml_feature_snapshots
+               WHERE game_pk=? AND player_id=? AND target=? AND feature_version=?""",
+            (int(game_pk), int(player_id), target, feature_version),
+        ).fetchone()
+        return row["ml_snapshot_id"] if row else None
+
+
+def record_settled_player_outcome(game_pk, player_id, player_name,
+                                  target_group, outcomes, game_date=None,
+                                  source="mlb-gameday", settled_at=None,
+                                  db_path=None):
+    """Append a normalized final result shared by future ML pipelines."""
+    with connect(db_path) as db:
+        cursor = db.execute(
+            """INSERT OR IGNORE INTO settled_player_outcomes(
+                 game_pk, game_date, player_id, player_name, target_group,
+                 outcomes_json, settled_at, source
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                int(game_pk), game_date, int(player_id), player_name,
+                target_group, json.dumps(outcomes, sort_keys=True),
+                settled_at or utc_now(), source,
+            ),
+        )
+        return cursor.rowcount
+
+
 def record_bullpen_snapshot(game_pk, team_id, team_name, scheduled_start,
                             captured_at, relievers, db_path=None):
     """Append one reproducible pregame bullpen-readiness snapshot."""
@@ -353,6 +408,22 @@ def settle_game_predictions(game_pk, pitching_lines, source="mlb-gameday", db_pa
                     prediction["prediction_id"], utc_now(), float(line["strikeouts"]), source,
                     line.get("batters_faced"), line.get("pitches"), line.get("outs"),
                     line.get("runs"), line.get("earned_runs"), line.get("hits"), line.get("walks"),
+                ),
+            )
+            db.execute(
+                """INSERT OR IGNORE INTO settled_player_outcomes(
+                     game_pk, game_date, player_id, player_name, target_group,
+                     outcomes_json, settled_at, source
+                   )
+                   SELECT ?, g.official_date, ?, p.player_name, 'pitcher_game',
+                          ?, ?, ?
+                     FROM model_predictions p
+                     LEFT JOIN games g ON g.game_pk=p.game_pk
+                    WHERE p.prediction_id=?""",
+                (
+                    int(game_pk), int(prediction["player_id"]),
+                    json.dumps(line, sort_keys=True), utc_now(), source,
+                    prediction["prediction_id"],
                 ),
             )
             settled.append(prediction["prediction_id"])

@@ -3,6 +3,7 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
+from datetime import datetime, timezone
 
 from analytics_store import connect, initialize
 from prediction_store import (
@@ -13,7 +14,11 @@ from prediction_store import (
 )
 from collections import defaultdict
 
-from sync_matchup_data import batter_context_store, batter_discipline_record, count_bucket, completed_game_observations, game_log_pks_from_payload, outcome_counts, process_feed
+from sync_matchup_data import (
+    active_slate_schedule, batter_context_store, batter_discipline_record,
+    count_bucket, completed_game_observations, game_log_pks_from_payload,
+    outcome_counts, process_feed,
+)
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "completed_game.json"
@@ -36,8 +41,8 @@ class StorageAndSyncTests(unittest.TestCase):
         initialize(self.db_path)
         with connect(self.db_path) as db:
             self.assertEqual(db.execute("SELECT value FROM legacy").fetchone()[0], "preserve me")
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 8)
-            self.assertEqual(db.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 8)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 10)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 10)
             columns = {row[1] for row in db.execute("PRAGMA table_info(gameday_batter_pitch_velocity)")}
             self.assertTrue({"doubles", "triples", "total_bases"}.issubset(columns))
             context_columns = {row[1] for row in db.execute("PRAGMA table_info(gameday_batter_pitch_context)")}
@@ -47,6 +52,11 @@ class StorageAndSyncTests(unittest.TestCase):
             self.assertTrue(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='gameday_batter_discipline'").fetchone())
             self.assertTrue(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='workload_overrides'").fetchone())
             self.assertTrue(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='bullpen_snapshots'").fetchone())
+            self.assertTrue(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='hitter_ml_examples'").fetchone())
+            self.assertTrue(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ml_feature_snapshots'").fetchone())
+            self.assertTrue(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='settled_player_outcomes'").fetchone())
+            self.assertTrue(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='pitcher_game_ml_examples'").fetchone())
+            self.assertTrue(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ml_model_registry'").fetchone())
 
     def test_bullpen_snapshots_are_append_only_and_read_as_one_unit(self):
         initialize(self.db_path)
@@ -116,6 +126,23 @@ class StorageAndSyncTests(unittest.TestCase):
             {"date": "2026-06-01", "game": {"gamePk": 3}, "team": {"id": 20}},
         ]}]}
         self.assertEqual(game_log_pks_from_payload(payload, "2026-06-01"), {1, 2})
+
+    def test_sync_all_uses_tomorrow_after_every_current_game_has_started(self):
+        calls = []
+        def load(_path, query):
+            calls.append(query["date"])
+            if query["date"] == "2026-04-10":
+                return {"dates": [{"games": [
+                    {"gamePk": 1, "status": {"abstractGameState": "Final"}},
+                    {"gamePk": 3, "status": {"abstractGameState": "Live"}},
+                ]}]}
+            return {"dates": [{"games": [{"gamePk": 2, "status": {"abstractGameState": "Preview"}}]}]}
+        day, schedule = active_slate_schedule(
+            datetime(2026, 4, 10, 18, tzinfo=timezone.utc), load,
+        )
+        self.assertEqual(day.isoformat(), "2026-04-11")
+        self.assertEqual(schedule["dates"][0]["games"][0]["gamePk"], 2)
+        self.assertEqual(calls, ["2026-04-10", "2026-04-11"])
 
     def test_starter_relief_and_handedness_fixture(self):
         rows = completed_game_observations(json.loads(FIXTURE.read_text()), "2026-04-11T00:00:00+00:00")

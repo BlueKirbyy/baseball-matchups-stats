@@ -1,25 +1,28 @@
 """No-key local server for the Diamond Intel MLB matchup board."""
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import json
+import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode, urlsplit
 from urllib.request import urlopen
 from analytics_store import connect, initialize
 from market_data import normalize_row
+from hitter_ml import shadow_prediction
 from modeling import (
+    HITTER_PLATOON_PRIOR_PA, LEAGUE_HITTER_AVERAGE, LEAGUE_HITTER_SLG,
     blend_full_game_hitter_matchup, hitter_arsenal_summary, hitter_k_risk,
-    hitter_market_context, hitter_pitch_summary, pitcher_k_projection,
+    hitter_market_context, hitter_pitch_summary, pitcher_k_projection, shrunk_rate,
 )
 from prediction_store import (
     add_market_snapshot, add_workload_override, latest_bullpen_snapshot,
     latest_markets, latest_workload_override,
-    record_game, record_pregame_snapshot,
+    record_game, record_ml_feature_snapshot, record_pregame_snapshot,
     ensure_pregame_prediction, is_before_start, pending_prediction_game_pks,
     prediction_tracking_summary, save_prediction, settle_game_predictions, utc_now,
 )
 
-PORT = 8000
+PORT = int(os.getenv("PORT", "8000"))
 MLB = "https://statsapi.mlb.com/api/v1"
 MLB_GAME_FEED = "https://statsapi.mlb.com/api/v1.1"
 ESPN = "https://site.api.espn.com/apis/site/v2/sports/baseball/mlb"
@@ -91,6 +94,35 @@ def local_game_time(value):
         return game_time.astimezone().strftime("%a, %b %d · %I:%M %p %Z").replace(" 0", " ")
     except (TypeError, ValueError):
         return "Time TBD"
+
+
+def espn_event_is_unstarted(event):
+    """Return whether an ESPN event can still begin on today's slate."""
+    status_type = (event.get("status") or {}).get("type") or {}
+    status_text = " ".join(
+        str(status_type.get(key) or "") for key in ("name", "shortDetail", "detail", "description")
+    ).lower()
+    if any(marker in status_text for marker in ("final", "postponed", "canceled", "cancelled")):
+        return False
+    return status_type.get("state") == "pre"
+
+
+def active_slate_date_and_scoreboard(now=None, scoreboard_loader=None):
+    """Keep today until no local-day event remains unstarted, then load tomorrow."""
+    scoreboard_loader = scoreboard_loader or get_espn_json
+    local_day = (now or datetime.now().astimezone()).astimezone().date()
+
+    def load(day):
+        key = day.strftime("%Y%m%d")
+        return scoreboard_loader("/scoreboard", {"dates": key, "limit": 100})
+
+    scoreboard = load(local_day)
+    events = scoreboard.get("events", [])
+    is_lookahead = not events or not any(espn_event_is_unstarted(event) for event in events)
+    slate_day = local_day + timedelta(days=1) if is_lookahead else local_day
+    if is_lookahead:
+        scoreboard = load(slate_day)
+    return slate_day, scoreboard, is_lookahead
 
 def median(values):
     ordered = sorted(values)
@@ -457,6 +489,64 @@ def hitter_k_profile_for_hand(db, season, batter_id, pitcher_throws):
     return profile
 
 
+def hitter_platoon_profile(db, season, batter_id, pitcher_throws):
+    """Build a handedness anchor before applying pitch/velocity refinements."""
+    overall = db.execute(
+        """SELECT SUM(pa) AS pa, SUM(at_bats) AS at_bats, SUM(hits) AS hits,
+                  SUM(total_bases) AS total_bases, SUM(hr) AS hr,
+                  SUM(strikeouts) AS strikeouts
+           FROM gameday_batter_pitch_velocity
+           WHERE season=? AND player_id=?""",
+        (season, batter_id),
+    ).fetchone()
+    hand = None
+    if pitcher_throws:
+        hand = db.execute(
+            """SELECT SUM(pa) AS pa, SUM(at_bats) AS at_bats, SUM(hits) AS hits,
+                      SUM(total_bases) AS total_bases, SUM(hr) AS hr,
+                      SUM(strikeouts) AS strikeouts
+               FROM gameday_batter_pitch_context
+               WHERE season=? AND player_id=? AND pitcher_throws=?""",
+            (season, batter_id, pitcher_throws),
+        ).fetchone()
+
+    overall = dict(overall) if overall else {}
+    hand = dict(hand) if hand and (hand["pa"] or 0) else overall
+    overall_ab = max(0, int(overall.get("at_bats") or 0))
+    overall_pa = max(0, int(overall.get("pa") or 0))
+    overall_avg = (overall.get("hits") or 0) / overall_ab if overall_ab else LEAGUE_HITTER_AVERAGE
+    overall_slg = (overall.get("total_bases") or 0) / overall_ab if overall_ab else LEAGUE_HITTER_SLG
+    hand_ab = max(0, int(hand.get("at_bats") or 0))
+    hand_pa = max(0, int(hand.get("pa") or 0))
+    hand_hits = max(0, int(hand.get("hits") or 0))
+    hand_tb = max(0, int(hand.get("total_bases") or 0))
+    posterior_avg = shrunk_rate(hand_hits, hand_ab, overall_avg, HITTER_PLATOON_PRIOR_PA)
+    posterior_slg = (
+        (hand_tb + overall_slg * HITTER_PLATOON_PRIOR_PA) /
+        (hand_ab + HITTER_PLATOON_PRIOR_PA)
+        if hand_ab + HITTER_PLATOON_PRIOR_PA else overall_slg
+    )
+    source = f"vs {pitcher_throws}HP" if pitcher_throws and hand is not overall else "all pitchers fallback"
+    return {
+        "pitcher_throws": pitcher_throws,
+        "label": source,
+        "source": source,
+        "pa": hand_pa,
+        "at_bats": hand_ab,
+        "hits": hand_hits,
+        "home_runs": max(0, int(hand.get("hr") or 0)),
+        "strikeouts": max(0, int(hand.get("strikeouts") or 0)),
+        "raw_avg": hand_hits / hand_ab if hand_ab else None,
+        "raw_slg": hand_tb / hand_ab if hand_ab else None,
+        "posterior_avg": posterior_avg,
+        "posterior_slg": posterior_slg,
+        "posterior_iso": max(0.0, posterior_slg - posterior_avg),
+        "overall_pa": overall_pa,
+        "overall_avg": overall_avg,
+        "overall_slg": overall_slg,
+    }
+
+
 def hitter_profile_for_pitcher(db, season, batter, pitcher_id, arsenal,
                                pitcher_throws, market_context):
     """Build the same pitch/velocity/context hitter evidence for any pitcher."""
@@ -521,19 +611,36 @@ def hitter_profile_for_pitcher(db, season, batter, pitcher_id, arsenal,
         (season, batter_id, *codes),
     ).fetchall() if codes else []
     quality_by_pitch = {row["pitch_code"]: dict(row) for row in quality_rows}
+    platoon = hitter_platoon_profile(db, season, batter_id, pitcher_throws)
     by_pitch = {}
     for pitch in arsenal[:5]:
         center = round(float(pitch["velo"] or 0))
-        velocity_row = db.execute(
-            """SELECT SUM(pa) AS pa, SUM(at_bats) AS at_bats, SUM(hits) AS hits,
-                      SUM(hr) AS hr, SUM(strikeouts) AS strikeouts, SUM(outs) AS outs,
-                      SUM(doubles) AS doubles, SUM(triples) AS triples,
-                      SUM(total_bases) AS total_bases
-               FROM gameday_batter_pitch_velocity
-               WHERE season=? AND player_id=? AND pitch_code=?
-                 AND velo_bucket BETWEEN ? AND ?""",
-            (season, batter_id, pitch["code"], center - 2, center + 2),
-        ).fetchone()
+        velocity_row = None
+        evidence_source = "all pitcher hands"
+        if pitcher_throws:
+            velocity_row = db.execute(
+                """SELECT SUM(pa) AS pa, SUM(at_bats) AS at_bats, SUM(hits) AS hits,
+                          SUM(hr) AS hr, SUM(strikeouts) AS strikeouts, SUM(outs) AS outs,
+                          SUM(doubles) AS doubles, SUM(triples) AS triples,
+                          SUM(total_bases) AS total_bases
+                   FROM gameday_batter_pitch_context
+                   WHERE season=? AND player_id=? AND pitch_code=? AND pitcher_throws=?
+                     AND velo_bucket BETWEEN ? AND ?""",
+                (season, batter_id, pitch["code"], pitcher_throws, center - 2, center + 2),
+            ).fetchone()
+            evidence_source = f"vs {pitcher_throws}HP"
+        if not velocity_row or (velocity_row["pa"] or 0) < 3:
+            velocity_row = db.execute(
+                """SELECT SUM(pa) AS pa, SUM(at_bats) AS at_bats, SUM(hits) AS hits,
+                          SUM(hr) AS hr, SUM(strikeouts) AS strikeouts, SUM(outs) AS outs,
+                          SUM(doubles) AS doubles, SUM(triples) AS triples,
+                          SUM(total_bases) AS total_bases
+                   FROM gameday_batter_pitch_velocity
+                   WHERE season=? AND player_id=? AND pitch_code=?
+                     AND velo_bucket BETWEEN ? AND ?""",
+                (season, batter_id, pitch["code"], center - 2, center + 2),
+            ).fetchone()
+            evidence_source = "all pitcher hands fallback"
         if velocity_row and (velocity_row["pa"] or 0) >= 3 and (velocity_row["at_bats"] or 0):
             velocity_range = "±2 mph"
             by_pitch[pitch["code"]] = {
@@ -543,26 +650,45 @@ def hitter_profile_for_pitcher(db, season, batter, pitcher_id, arsenal,
                 "outs": velocity_row["outs"], "advanced": hitter_power_metrics(velocity_row),
                 "context": context_for(pitch, velocity_row, velocity_range),
                 "quality": quality_by_pitch.get(pitch["code"]), "range": velocity_range,
+                "evidence_source": evidence_source,
             }
         elif pitch["code"] in exact_rows:
             row = exact_rows[pitch["code"]]
-            outcome_row = db.execute(
-                """SELECT SUM(pa) AS pa, SUM(at_bats) AS at_bats, SUM(hits) AS hits,
-                          SUM(hr) AS hr, SUM(strikeouts) AS strikeouts, SUM(outs) AS outs,
-                          SUM(doubles) AS doubles, SUM(triples) AS triples,
-                          SUM(total_bases) AS total_bases
-                   FROM gameday_batter_pitch_velocity
-                   WHERE season=? AND player_id=? AND pitch_code=?""",
-                (season, batter_id, pitch["code"]),
-            ).fetchone()
+            outcome_row = None
+            if pitcher_throws:
+                outcome_row = db.execute(
+                    """SELECT SUM(pa) AS pa, SUM(at_bats) AS at_bats, SUM(hits) AS hits,
+                              SUM(hr) AS hr, SUM(strikeouts) AS strikeouts, SUM(outs) AS outs,
+                              SUM(doubles) AS doubles, SUM(triples) AS triples,
+                              SUM(total_bases) AS total_bases
+                       FROM gameday_batter_pitch_context
+                       WHERE season=? AND player_id=? AND pitch_code=? AND pitcher_throws=?""",
+                    (season, batter_id, pitch["code"], pitcher_throws),
+                ).fetchone()
+                evidence_source = f"vs {pitcher_throws}HP"
+            if not outcome_row or (outcome_row["pa"] or 0) < 3:
+                outcome_row = db.execute(
+                    """SELECT SUM(pa) AS pa, SUM(at_bats) AS at_bats, SUM(hits) AS hits,
+                              SUM(hr) AS hr, SUM(strikeouts) AS strikeouts, SUM(outs) AS outs,
+                              SUM(doubles) AS doubles, SUM(triples) AS triples,
+                              SUM(total_bases) AS total_bases
+                       FROM gameday_batter_pitch_velocity
+                       WHERE season=? AND player_id=? AND pitch_code=?""",
+                    (season, batter_id, pitch["code"]),
+                ).fetchone()
+                evidence_source = "all pitcher hands fallback"
             velocity_range = "all velo"
+            outcome_ab = (outcome_row["at_bats"] or 0) if outcome_row else 0
             by_pitch[pitch["code"]] = {
-                "pa": row["pa"], "avg": row["avg"], "hr": row["hr"],
+                "pa": outcome_row["pa"] if outcome_row else row["pa"],
+                "avg": f"{outcome_row['hits'] / outcome_ab:.3f}" if outcome_ab else row["avg"],
+                "hr": outcome_row["hr"] if outcome_row else row["hr"],
                 "strikeouts": outcome_row["strikeouts"] if outcome_row else None,
                 "outs": outcome_row["outs"] if outcome_row else None,
                 "advanced": hitter_power_metrics(outcome_row),
                 "context": context_for(pitch, outcome_row, velocity_range),
                 "quality": quality_by_pitch.get(pitch["code"]), "range": velocity_range,
+                "evidence_source": evidence_source,
             }
     public_batter = dict(batter)
     hitter = {
@@ -571,10 +697,14 @@ def hitter_profile_for_pitcher(db, season, batter, pitcher_id, arsenal,
         "season": dict(season_row) if season_row else {"pa": "—", "avg": "—", "hr": "—"},
         "discipline": dict(discipline_row) if discipline_row else {},
         "vs_pitches": by_pitch,
+        "platoon": platoon,
         "k_profile": hitter_k_profile_for_hand(db, season, batter_id, pitcher_throws),
     }
     for stat in by_pitch.values():
-        stat["research"] = hitter_pitch_summary(stat)
+        stat["research"] = hitter_pitch_summary(stat, prior={
+            "avg": platoon["posterior_avg"], "slg": platoon["posterior_slg"],
+            "iso": platoon["posterior_iso"],
+        })
     hitter["arsenal_research"] = hitter_arsenal_summary(
         hitter, arsenal[:5], market_context=market_context,
     )
@@ -632,7 +762,22 @@ def matchup_research(game_pk):
             placeholders = ",".join("?" for _ in batter_ids)
             opponent_row = db.execute(f"SELECT SUM(pa) AS pa, SUM(strikeouts) AS strikeouts FROM gameday_batter_pitch_velocity WHERE season=? AND player_id IN ({placeholders})", (season, *batter_ids)).fetchone() if batter_ids else None
             opponent_k_rate = (opponent_row["strikeouts"] / opponent_row["pa"]) if opponent_row and opponent_row["pa"] and opponent_row["strikeouts"] is not None else None
-            side = {"pitcher_id": pitcher["id"], "pitcher": pitcher["fullName"], "pitcher_throws": pitcher_throws, "arsenal": arsenal, "arsenal_season": arsenal[0]["source_season"], "workload": workload, "appearance_history": appearance_history, "opponent_k_rate": opponent_k_rate, "lineup_confirmed": lineup_confirmed, "data_freshness_seconds": data_freshness_seconds, "batting_team": batting_team, "market_context": market_context, "batters": hitter_rows}
+            team_workload_history = [dict(row) for row in db.execute(
+                """SELECT game_date, player_id, team_id, batters_faced, strikeouts,
+                          outs, pitches, walks_allowed, hits_allowed, runs_allowed,
+                          earned_runs, is_start
+                     FROM player_game_observations
+                    WHERE role='pitcher' AND is_start=1 AND team_id=? AND game_date<?
+                    ORDER BY game_date, game_pk""",
+                (pitching_team["id"], official_date),
+            )]
+            snapshots = latest_bullpen_snapshot(game_pk, pitching_team["id"], captured_at)
+            bullpen_context = {
+                "pitches_yesterday": sum(number(row.get("pitches_yesterday")) or 0 for row in snapshots),
+                "three_day_pitches": sum(number(row.get("three_day_pitches")) or 0 for row in snapshots),
+                "arms_yesterday": sum((number(row.get("pitches_yesterday")) or 0) > 0 for row in snapshots),
+            }
+            side = {"pitcher_id": pitcher["id"], "pitcher": pitcher["fullName"], "pitcher_throws": pitcher_throws, "pitching_team_id": pitching_team["id"], "official_date": official_date, "arsenal": arsenal, "arsenal_season": arsenal[0]["source_season"], "workload": workload, "appearance_history": appearance_history, "team_workload_history": team_workload_history, "bullpen_context": bullpen_context, "opponent_k_rate": opponent_k_rate, "lineup_confirmed": lineup_confirmed, "data_freshness_seconds": data_freshness_seconds, "batting_team": batting_team, "market_context": market_context, "batters": hitter_rows}
             side["workload_override"] = latest_workload_override(game_pk, pitcher["id"], captured_at)
             markets = latest_markets(game_pk, player_id=pitcher["id"], player_name=pitcher["fullName"], as_of=captured_at)
             market_predictions = [pitcher_k_projection(side, market, captured_at, scheduled_start) for market in markets]
@@ -645,10 +790,15 @@ def matchup_research(game_pk):
                 ),
             ) if market_predictions else pitcher_k_projection(side, None, captured_at, scheduled_start)
             side["market_projections"] = market_predictions
-
-            snapshots = latest_bullpen_snapshot(
-                game_pk, pitching_team["id"], captured_at,
-            )
+            challenger = (side.get("projection") or {}).get("workload_challenger") or {}
+            if challenger.get("features"):
+                side["ml_feature_snapshot_id"] = record_ml_feature_snapshot(
+                    game_pk, captured_at, scheduled_start, pitcher["id"],
+                    pitcher["fullName"], "pitcher_workload",
+                    challenger.get("model_version") or "pitcher-workload-challenger-v1",
+                    challenger.get("feature_version") or "pitcher-game-pre-event-v1",
+                    challenger["features"], lineup_confirmed=lineup_confirmed,
+                )
             relievers = []
             for snapshot in snapshots:
                 reliever_id = snapshot["player_id"]
@@ -696,6 +846,13 @@ def matchup_research(game_pk):
                     hitter, hitter["arsenal_research"], bullpen_entries,
                     expected_bf, bf_interval, market_context,
                 )
+                try:
+                    hitter["ml_research"] = shadow_prediction(hitter, side)
+                except (KeyError, TypeError, ValueError, OSError) as error:
+                    hitter["ml_research"] = {
+                        "available": False, "status": "unavailable",
+                        "message": f"Hitter challenger unavailable: {error}",
+                    }
             public_relievers = []
             for reliever in relievers:
                 hitter_fits = []
@@ -774,13 +931,15 @@ def matchup_research(game_pk):
         "home": home, "away": away,
     }
 
-def games_for_today():
+def games_for_today(now=None, scoreboard_loader=None, schedule_loader=None):
     # MLB's schedule should follow the user/server calendar day, not UTC.
-    # This keeps late-evening East Coast games on today's slate after midnight UTC.
+    # Keep today visible while at least one game has not started, then expose tomorrow's
+    # look-ahead slate even when starters and lineups are still unannounced.
     settle_finished_predictions()
-    date = datetime.now().astimezone().strftime("%Y%m%d")
-    scoreboard = get_espn_json("/scoreboard", {"dates": date, "limit": 100})
-    mlb_schedule = get_json("/schedule", {"sportId": 1, "date": f"{date[:4]}-{date[4:6]}-{date[6:]}", "hydrate": "probablePitcher"})
+    slate_day, scoreboard, is_lookahead = active_slate_date_and_scoreboard(now, scoreboard_loader)
+    slate_date = slate_day.isoformat()
+    schedule_loader = schedule_loader or get_json
+    mlb_schedule = schedule_loader("/schedule", {"sportId": 1, "date": slate_date, "hydrate": "probablePitcher"})
     mlb_by_teams = {}
     for day in mlb_schedule.get("dates", []):
         for game in day.get("games", []):
@@ -809,19 +968,24 @@ def games_for_today():
         if mlb_game.get("gamePk"):
             record_game({
                 "game_pk": mlb_game["gamePk"], "scheduled_start": event.get("date"),
-                "official_date": f"{date[:4]}-{date[4:6]}-{date[6:]}",
+                "official_date": slate_date,
                 "away_team_id": mlb_teams.get("away", {}).get("team", {}).get("id"),
                 "away_team_name": away_team.get("displayName"),
                 "home_team_id": mlb_teams.get("home", {}).get("team", {}).get("id"),
                 "home_team_name": home_team.get("displayName"),
                 "venue_name": competition.get("venue", {}).get("fullName"),
             })
-    slate_date = f"{date[:4]}-{date[4:6]}-{date[6:]}"
     odds_by_game, odds_message = odds_for_slate(games, slate_date)
     for game in games:
         game["odds"] = odds_by_game.get(game["gamePk"])
         game.pop("espn_odds", None)
-    return {"date": slate_date, "odds_message": odds_message, "games": games}
+    return {
+        "date": slate_date,
+        "is_lookahead": is_lookahead,
+        "slate_label": "Tomorrow's look-ahead slate" if is_lookahead else "Today's MLB slate",
+        "odds_message": odds_message,
+        "games": games,
+    }
 
 class Handler(SimpleHTTPRequestHandler):
     def end_headers(self):

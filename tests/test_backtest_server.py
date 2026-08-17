@@ -2,7 +2,10 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 from backtest import calibration_rows, chronological_splits, evaluate
-from server import Handler, confirmed_starting_lineup, hitter_context_metrics, hitter_power_metrics, local_game_time, odds_ttl_seconds
+from server import (
+    Handler, active_slate_date_and_scoreboard, confirmed_starting_lineup,
+    hitter_context_metrics, hitter_power_metrics, local_game_time, odds_ttl_seconds,
+)
 
 
 class BacktestAndServerTests(unittest.TestCase):
@@ -49,6 +52,57 @@ class BacktestAndServerTests(unittest.TestCase):
         now = datetime.now(timezone.utc)
         self.assertEqual(odds_ttl_seconds([{"start_time": (now + timedelta(minutes=10)).isoformat()}]), 60)
         self.assertNotEqual(local_game_time("2026-04-10T23:00:00Z"), "Time TBD")
+
+    def test_active_slate_stays_today_while_a_local_game_is_unstarted(self):
+        calls = []
+        def load(_path, query):
+            calls.append(query["dates"])
+            return {"events": [
+                {"status": {"type": {"state": "post", "completed": True}}},
+                {"status": {"type": {"state": "pre", "completed": False}}},
+            ]}
+        day, _scoreboard, lookahead = active_slate_date_and_scoreboard(
+            datetime(2026, 4, 10, 18, tzinfo=timezone.utc), load,
+        )
+        self.assertEqual(day.isoformat(), "2026-04-10")
+        self.assertFalse(lookahead)
+        self.assertEqual(calls, ["20260410"])
+
+    def test_active_slate_rolls_to_tomorrow_when_every_game_has_started(self):
+        calls = []
+        def load(_path, query):
+            calls.append(query["dates"])
+            if query["dates"] == "20260410":
+                return {"events": [
+                    {"status": {"type": {"state": "post", "completed": True}}},
+                    {"status": {"type": {"state": "in", "completed": False, "detail": "Top 7th"}}},
+                ]}
+            return {"events": [{"status": {"type": {"state": "pre", "completed": False}}}]}
+        day, scoreboard, lookahead = active_slate_date_and_scoreboard(
+            datetime(2026, 4, 10, 18, tzinfo=timezone.utc), load,
+        )
+        self.assertEqual(day.isoformat(), "2026-04-11")
+        self.assertTrue(lookahead)
+        self.assertEqual(len(scoreboard["events"]), 1)
+        self.assertEqual(calls, ["20260410", "20260411"])
+
+    def test_active_slate_rolls_to_tomorrow_after_every_game_finishes(self):
+        calls = []
+        def load(_path, query):
+            calls.append(query["dates"])
+            if query["dates"] == "20260410":
+                return {"events": [
+                    {"status": {"type": {"state": "post", "completed": True, "detail": "Final"}}},
+                    {"status": {"type": {"detail": "Postponed"}}},
+                ]}
+            return {"events": [{"status": {"type": {"state": "pre", "completed": False}}}]}
+        day, scoreboard, lookahead = active_slate_date_and_scoreboard(
+            datetime(2026, 4, 10, 18, tzinfo=timezone.utc), load,
+        )
+        self.assertEqual(day.isoformat(), "2026-04-11")
+        self.assertTrue(lookahead)
+        self.assertEqual(len(scoreboard["events"]), 1)
+        self.assertEqual(calls, ["20260410", "20260411"])
 
     def test_hitter_power_metrics_are_derived_from_final_pitch_counts(self):
         metrics = hitter_power_metrics({"at_bats": 20, "hits": 6, "doubles": 2, "triples": 1, "hr": 1, "total_bases": 14})

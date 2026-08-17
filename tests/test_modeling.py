@@ -49,6 +49,73 @@ class ModelingTests(unittest.TestCase):
         self.assertEqual(result["label"], "favorable contact research")
         self.assertEqual((result["tier"], result["tone"]), ("favorable", "good"))
 
+    def test_strong_hitter_label_requires_context_and_respects_platoon_conflict(self):
+        strong = hitter_arsenal_summary(
+            {"platoon": {"posterior_avg": .270, "posterior_slg": .460},
+             "vs_pitches": {"FF": {"pa": 100, "avg": ".360",
+                            "advanced": {"slg": .700},
+                            "context": {"coverage": .30}}}},
+            [{"code": "FF", "usage": 100}],
+        )
+        self.assertEqual(strong["tier"], "strong")
+        conflicted = hitter_arsenal_summary(
+            {"platoon": {"posterior_avg": .220, "posterior_slg": .340,
+                          "raw_avg": .190, "at_bats": 140, "label": "vs LHP"},
+             "vs_pitches": {"FF": {"pa": 55, "avg": ".380",
+                            "advanced": {"slg": .650},
+                            "context": {"coverage": .10}}}},
+            [{"code": "FF", "usage": 100}],
+        )
+        self.assertNotEqual(conflicted["tier"], "strong")
+        self.assertTrue(conflicted["platoon_disagreement"])
+        risks = conflicted["opportunities"]["items"]["overall"]["risks"]
+        self.assertTrue(any("platoon" in risk or "baseline" in risk for risk in risks))
+
+    def test_live_scale_strong_gate_uses_top_tail_full_game_coverage(self):
+        strong = hitter_arsenal_summary(
+            {"vs_pitches": {"FF": {"pa": 40, "avg": ".360",
+                            "advanced": {"slg": .700},
+                            "context": {"coverage": .04}}}},
+            [{"code": "FF", "usage": 100}],
+        )
+        self.assertTrue(strong["strong_evidence"])
+        self.assertEqual(strong["tier"], "strong")
+
+        thin_context = hitter_arsenal_summary(
+            {"vs_pitches": {"FF": {"pa": 40, "avg": ".360",
+                            "advanced": {"slg": .700},
+                            "context": {"coverage": .02}}}},
+            [{"code": "FF", "usage": 100}],
+        )
+        self.assertFalse(thin_context["strong_evidence"])
+        self.assertEqual(thin_context["tier"], "favorable")
+
+    def test_tiny_high_projection_is_labeled_high_risk_with_reasons(self):
+        batter = {
+            "season": {"pa": 43},
+            "platoon": {
+                "label": "vs LHP", "at_bats": 19,
+                "posterior_avg": .310, "posterior_slg": .680,
+            },
+            "vs_pitches": {
+                "FF": {
+                    "pa": 9, "avg": ".500",
+                    "advanced": {"slg": "1.100"},
+                    "context": {"coverage": .01},
+                }
+            },
+        }
+        result = hitter_arsenal_summary(batter, [{"code": "FF", "usage": 100}])
+
+        self.assertGreater(result["expected_slg"], .650)
+        self.assertEqual(result["risk"]["level"], "high")
+        reasons = " | ".join(result["risk"]["reasons"])
+        self.assertIn("arsenal coverage", reasons)
+        self.assertIn("effective PA", reasons)
+        self.assertIn("AB in the vs LHP split", reasons)
+        self.assertIn("current-season PA", reasons)
+        self.assertEqual(result["opportunities"]["risk"], result["risk"])
+
     def test_power_is_part_of_the_hitter_fit_score(self):
         contact_only = hitter_arsenal_summary(
             {"vs_pitches": {"FF": {"pa": 60, "avg": ".260"}}},
@@ -89,8 +156,10 @@ class ModelingTests(unittest.TestCase):
         opportunities = result["opportunities"]["items"]
         self.assertEqual(set(opportunities), {"overall", "hit", "total_bases", "home_run", "runs_rbi"})
         self.assertEqual(opportunities["hit"]["tier"], "neutral")
-        self.assertEqual(opportunities["total_bases"]["tier"], "strong")
-        self.assertEqual(opportunities["home_run"]["tier"], "strong")
+        # A high point estimate with only usable (not strong) context evidence
+        # is intentionally capped at favorable.
+        self.assertEqual(opportunities["total_bases"]["tier"], "favorable")
+        self.assertEqual(opportunities["home_run"]["tier"], "favorable")
         self.assertEqual(result["opportunities"]["primary"], "home_run")
         self.assertIn("Runs/RBIs also depend", opportunities["runs_rbi"]["risks"][0])
 
@@ -150,10 +219,16 @@ class ModelingTests(unittest.TestCase):
 
     def test_pitch_contact_colors_require_sample_and_use_shrinkage(self):
         tiny = hitter_pitch_summary({"pa": 3, "avg": "1.000"})
+        prior_driven = hitter_pitch_summary(
+            {"pa": 10, "avg": "0.000", "advanced": {"slg": 0.0}},
+            prior={"avg": 0.310, "slg": 0.580, "iso": 0.270},
+        )
         favorable = hitter_pitch_summary({"pa": 25, "avg": "0.500"})
         poor = hitter_pitch_summary({"pa": 25, "avg": "0.000"})
         neutral = hitter_pitch_summary({"pa": 25, "avg": "0.250"})
         self.assertEqual((tiny["label"], tiny["tone"]), ("low data", "neutral"))
+        self.assertEqual((prior_driven["label"], prior_driven["tone"]), ("prior-driven", "neutral"))
+        self.assertLess(prior_driven["reliability"], 0.25)
         self.assertEqual((favorable["label"], favorable["tone"]), ("favorable", "good"))
         self.assertEqual((poor["label"], poor["tone"]), ("poor", "bad"))
         self.assertEqual((neutral["label"], neutral["tone"]), ("neutral", "neutral"))

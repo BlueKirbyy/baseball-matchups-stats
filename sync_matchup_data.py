@@ -731,10 +731,33 @@ def sync_game(game_pk, season, workers):
     if fallback_count: print(f"Game {game_pk}: used prior-season pitch history for {fallback_count} starter(s).")
     if failures: print(f"{len(failures)} game feeds failed; rerun safely to retry them.")
 
-def todays_game_pks():
-    # Match the board's local-calendar slate instead of rolling over at UTC midnight.
-    date = datetime.now().astimezone().date().isoformat()
-    schedule = mlb("/schedule", {"sportId": 1, "date": date})
+def schedule_game_is_unstarted(game):
+    status = game.get("status") or {}
+    detail = str(status.get("detailedState") or "").lower()
+    if any(marker in detail for marker in ("final", "postponed", "canceled", "cancelled")):
+        return False
+    return status.get("abstractGameState") == "Preview" or status.get("codedGameState") in {"P", "S"}
+
+
+def active_slate_schedule(now=None, schedule_loader=None):
+    """Use tomorrow after every local-calendar game has started or been resolved."""
+    schedule_loader = schedule_loader or mlb
+    local_day = (now or datetime.now().astimezone()).astimezone().date()
+
+    def load(day):
+        return schedule_loader("/schedule", {"sportId": 1, "date": day.isoformat()})
+
+    schedule = load(local_day)
+    games = [game for day in schedule.get("dates", []) for game in day.get("games", [])]
+    if not games or not any(schedule_game_is_unstarted(game) for game in games):
+        local_day += timedelta(days=1)
+        schedule = load(local_day)
+    return local_day, schedule
+
+
+def todays_game_pks(now=None, schedule_loader=None):
+    # Match the board's automatic today/tomorrow rollover.
+    _date, schedule = active_slate_schedule(now, schedule_loader)
     game_pks = []
     for day in schedule.get("dates", []):
         for game in day.get("games", []):
@@ -747,7 +770,7 @@ def main():
     parser = argparse.ArgumentParser(description="Build local pitcher-arsenal and hitter-fit profiles from MLB Gameday feeds")
     choice = parser.add_mutually_exclusive_group(required=True)
     choice.add_argument("--game-pk", type=int, help="Upcoming MLB game ID to analyze")
-    choice.add_argument("--all", action="store_true", help="Attempt every game on today's slate; games without two live-feed probable starters are skipped")
+    choice.add_argument("--all", action="store_true", help="Attempt every game on the active slate (tomorrow after today's games have all started); games without two live-feed probable starters are skipped")
     parser.add_argument("--season", type=int, default=datetime.now(timezone.utc).year)
     parser.add_argument("--workers", type=int, default=8)
     args = parser.parse_args()

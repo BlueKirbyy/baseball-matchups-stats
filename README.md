@@ -9,6 +9,7 @@ The current pitcher-strikeout model is an unvalidated research baseline. The app
 - `sync_matchup_data.py`: downloads and caches MLB Gameday feeds, builds current matchup aggregates, and records immutable player-game observations.
 - `analytics_store.py`: SQLite schema plus numbered, non-destructive migrations.
 - `modeling.py`: empirical-Bayes shrinkage, arsenal coverage, bullpen readiness/exposure, pitcher-K workload, count distributions, and market math.
+- `pitcher_ml.py` / `train_pitcher_ml.py`: chronological starter-game features, workload challengers, dependency-free shadow inference, and the workload-driven K distribution.
 - `prediction_store.py`: append-only pregame, market, prediction, and result records.
 - `market_data.py`: sportsbook/pick'em CSV and manual market import.
 - `backtest.py`: chronological evaluation, calibration, distribution comparison, ROI, and same-line CLV.
@@ -36,7 +37,7 @@ python3 -m unittest discover -s tests -v
 
 ## Database migrations
 
-Starting the server or a CLI calls `analytics_store.initialize()`. Migrations are recorded in `schema_migrations`; the current version is 8. Existing research tables and rows are retained. Database triggers reject updates and deletes on observations, pregame snapshots, bullpen snapshots, market snapshots, workload overrides, predictions, and results.
+Starting the server or a CLI calls `analytics_store.initialize()`. Migrations are recorded in `schema_migrations`; the current version is 10. Existing research tables and rows are retained. Database triggers reject updates and deletes on observations, pregame snapshots, ML feature snapshots, settled outcomes, training examples, bullpen snapshots, market snapshots, workload overrides, predictions, and results.
 
 To inspect the database safely:
 
@@ -54,11 +55,18 @@ Sync one upcoming game:
 python3 sync_statcast.py --game-pk 823917
 ```
 
-Sync today’s slate:
+Sync the active slate:
 
 ```bash
 python3 sync_statcast.py --all
 ```
+
+The active slate follows the computer's local date while any game remains
+unstarted. As soon as every game has begun, been postponed, or been canceled,
+both the dashboard and `--all` automatically switch to tomorrow's schedule,
+even if the final game is still in progress.
+Tomorrow's games remain visible when probable starters or confirmed lineups
+have not been announced yet.
 
 The sync reuses `.gameday_cache`. It enforces a strict `game_date < target_game_date` historical cutoff. Team schedules are supplemented with player-specific game logs, which preserves games played for former teams after a trade. Completed feeds create game-level pitcher and batter observations, including starter classification and handedness.
 
@@ -157,6 +165,40 @@ The batter spotlight separates overall offense, 1+ hit, total-base power, home-r
 
 Batters qualify only when the official lineup is confirmed, the selected outcome read is favorable, evidence is usable or strong, coverage is at least 35%, and effective evidence is at least 10 PA. Cards state why the hitter surfaced, the most important risk, coverage, and effective sample. The categories are research rankings—not calibrated prop probabilities. If nobody qualifies, the panel clearly switches to a lower-confidence watchlist rather than disappearing or relaxing the thresholds silently.
 
+### Train the hitter challengers
+
+The normal server still runs with system Python and no ML dependency. Training uses an isolated virtual environment and writes the large immutable example set to ignored `hitter_training.db`; the small pure-JSON model artifact is loaded by the regular server.
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python train_hitter_ml.py
+```
+
+The command scans saved completed MLB Gameday feeds in chronological order, builds pre-event features, trains logistic and histogram-gradient-boosting challengers, calibrates them on a later block, tests on the latest block, verifies the dependency-free export, and writes `models/hitter_ml_registry.json`. It defaults to shadow mode. To promote only targets that pass every documented out-of-time gate:
+
+```bash
+.venv/bin/python train_hitter_ml.py --skip-build --promote-eligible
+```
+
+Do not promote a target just because one metric improved. Review the generated Brier, log-loss, ECE, sample, and positive-event counts in the registry and update the model card for each release.
+
+### Train the pitcher workload challenger
+
+The workload trainer reconstructs features before every historical start from
+the immutable observation store, then trains batters-faced, pitch-count, outs,
+and early-exit models with chronological train/calibration/test blocks.
+
+```bash
+.venv/bin/python train_pitcher_ml.py
+```
+
+The exported `models/pitcher_workload_registry.json` is loaded by the normal
+dependency-free server. Its BF/pitch/outs estimates and the resulting K
+distribution are displayed as **shadow only** and cannot change rankings or a
+research decision. Extreme disagreements with recent-start workload are
+limited and explicitly shown as a red risk warning.
+
 ## Save and settle predictions
 
 Save the projection visible for a game/player:
@@ -213,8 +255,8 @@ An empty report is expected until immutable predictions are saved and settled. H
 - Pitch-cell SLG, ISO, and XBH are descriptive final-pitch outcomes, not hit or total-base prop probabilities.
 - The displayed barrel value is explicitly a conservative proxy, not MLB’s official Barrel metric. No xwOBA is fabricated.
 - Weather is labeled as the MLB feed value, not a dedicated forecast.
-- Park geometry and umpire history remain descriptive in model v4. The raw umpire K% is excluded because it is confounded by assigned players. Hitter pitch cells use the opposing pitcher's throwing-hand split; batter-side and full platoon adjustments remain future work.
-- Hitter contact research is shrinkage-aware but is not yet a prop probability model. Bullpen exposure is a weighted descriptive blend, not a calibrated simulation of manager decisions. Batter strikeouts, hits, total bases, and rare-event home-run forecasts require their own validated targets.
+- Park geometry and umpire history remain descriptive in model v4. The raw umpire K% is excluded because it is confounded by assigned players. Hitter pitch cells and their priors use the opposing pitcher's throwing-hand split, with clearly labeled all-hand fallback when the split is too sparse.
+- Hitter contact research is shrinkage-aware. Separate hit/XBH/HR/K challengers run in shadow with calibrated out-of-time probabilities, but they do not affect the empirical rankings until a target clears its promotion gate. Bullpen exposure remains a weighted descriptive blend, not a calibrated simulation of manager decisions.
 
 ## Adding a provider or prop
 

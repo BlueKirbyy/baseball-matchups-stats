@@ -1,3 +1,6 @@
 .env
 .gameday_cache/
 __pycache__/
+.venv/
+models/*.joblib
+hitter_training.db*

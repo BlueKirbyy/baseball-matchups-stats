@@ -42,6 +42,16 @@ Current settled out-of-sample sample size: 0 at release. Calibration, ROI, and C
 
 Do not enable a `BET` state merely because historical ROI is positive. At minimum require a predeclared, chronologically held-out sample, acceptable calibration, improvement over simple and market baselines, sufficient bets across multiple months, stable sensitivity results, and positive CLV after accounting for vig. Document the exact thresholds and results in a new model version.
 
+### Workload challenger: `pitcher-workload-challenger-v1`
+
+Feature version: `pitcher-game-pre-event-v1`. Status: shadow; it is displayed beside the production empirical workload but cannot change rankings, confidence, or decisions.
+
+One immutable example is built per historical starter-game. Every feature is reconstructed from games ending before the target game, and state is updated only after the whole game is labeled. Features cover prior and recent BF/pitches/outs, pitcher efficiency and command, days rest, team hook history, opposing-lineup K/traffic/power, recent bullpen use, and season progress. Whole games are split chronologically into 65% train, 17% calibration, and 18% untouched test. Ridge regression is compared with histogram gradient boosting; separate quantile models form workload intervals, and calibrated logistic/gradient challengers estimate early exit.
+
+The August 16 artifact used 2410 train, 630 calibration, and 668 test starts through August 15. Gradient boosting reduced held-out MAE versus the prior-start historical baseline from 3.221 to 2.931 BF (9.0%), 10.878 to 9.767 pitches (10.2%), and 3.104 to 2.919 outs (6.0%). Empirical coverage for the nominal 80% intervals was 78.3%, 81.3%, and 78.6%, respectively. Early-exit log loss improved from 0.669 to 0.615. These results make the challenger suitable for prospective shadow tracking, not production promotion.
+
+At runtime, the shadow BF distribution is combined with the same transparent opponent-adjusted K rate used by v4 to produce a second K distribution. Outputs that move implausibly far from recent-start workload are capped and carry an explicit red risk warning. This safety rule is not evidence that the prediction is correct; it prevents an experimental tail estimate from being presented without context.
+
 ### Known failure modes
 
 - Probable starters, roles, pitch limits, injuries, and lineups can change after capture.
@@ -67,3 +77,25 @@ Do not enable a `BET` state merely because historical ROI is positive. At minimu
 - Using active-roster research as a confirmed-lineup signal
 - Inferring official xwOBA, injury status, or a live sportsbook price when it was not supplied
 - Using hitter contact research as a probability for hits, total bases, or home runs
+
+## Hitter challengers: `hitter-challenger-v1`
+
+Feature version: `hitter-pa-pre-event-v1`
+
+Status: shadow. Shadow outputs are displayed beside the empirical-Bayes read but do not change spotlight ordering, strong/favorable labels, or a wagering decision.
+
+### Leakage controls and features
+
+Each example is one completed regular-season plate appearance. Games are read chronologically; features for every PA in a game are created from state ending before that game, and state is updated only after the entire game has been labeled. The split is by whole game and time: 65% train, the next 17% calibration, and the latest 18% untouched test. Features include season-to-date hitter rates, opposing-hand platoon rates, pitch-mix fit and coverage, pitcher results and repertoire, lineup position, same-side status, velocity, and starter/reliever role. Current-day outcomes, closing markets, and future games are excluded.
+
+The production empirical model now anchors every pitch/velocity cell to the batter's opposing-hand platoon posterior. A same-hand, velocity-matched cell is preferred; an all-hand fallback is explicitly labeled. Missing arsenal mass keeps the platoon prior. A strong label requires at least 35% reliable full-game arsenal coverage, 30 effective PA, and 3% exact count/zone context coverage. Those percentages are not interchangeable: full-game coverage is diluted by every unmodeled pitch and reliever, while context coverage is the much narrower pitcher-hand/count/zone intersection. On the August 15 validation slate, the former policy's 55%/25 PA/20% thresholds admitted 0 of 180 confirmed-lineup hitters because observed maxima were 37% full-game and 8% exact-context coverage; the revised joint gate admitted only two top-tail evidence profiles before matchup direction was considered. A high score with merely usable evidence is capped at favorable. A 100+ AB raw platoon split that materially disagrees with the pitch-fit estimate blocks a strong label and is shown as a downgrade risk.
+
+Matchup direction and stability risk are separate outputs. A signal is marked high risk when it has a critical evidence failure or at least two instability flags: under 15% arsenal coverage, under 10 effective PA, under 2% exact-context coverage, under 50 opposing-hand AB, or under 100 current-season PA. More severe cutoffs—under 10% coverage, five effective PA, 25 opposing-hand AB, or 60 season PA—trigger high risk on their own. A platoon conflict also triggers high risk. The UI renders these cases in red, lists the exact failing inputs, keeps them out of Strong lists, and ranks them behind better-supported watchlist signals.
+
+### Challengers, calibration, and promotion
+
+For hit, extra-base hit, home run, and strikeout targets, training compares a regularized logistic baseline with a histogram gradient-boosting challenger. Both are sigmoid-calibrated on the middle time block. The final JSON export is evaluated by the dependency-free server; training verifies exported predictions against scikit-learn before saving it.
+
+Promotion is per target and requires at least 1,000 out-of-time test PA, at least 100 positives, at least 0.5% log-loss improvement over a constant-rate baseline, Brier score no worse than baseline, and expected calibration error no greater than 0.04. Passing those numerical gates only marks a target eligible. It remains shadow unless training is run with `--promote-eligible`. The August 15 build used 90,672 train, 23,716 calibration, and 25,016 test PA through August 14; strikeout was eligible, while hit, XBH, and HR did not clear the predeclared improvement threshold. All remain shadow.
+
+The UI converts per-PA hit, HR, and strikeout estimates to at-least-one event probabilities using expected PA and displays a range based on challenger disagreement and out-of-time calibration error. Expected total bases is a transparent approximation from the hit/XBH/HR probabilities. These are model estimates, not sportsbook-edge or profitability claims.

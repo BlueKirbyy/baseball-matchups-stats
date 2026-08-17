@@ -62,9 +62,35 @@ class DashboardSpotlightTests(unittest.TestCase):
         self.assertIn("lineup_k_evidence?.coverage", self.page)
         self.assertIn("data_grade?.grade", self.page)
         self.assertIn("effective_sample_size)>=10", self.page)
-        self.assertIn("expected BF", self.page)
+        self.assertIn("Expected to face ${Number(p.expected_batters_faced||0).toFixed(1)} hitters", self.page)
         self.assertNotIn("fitRating", self.page)
         self.assertNotIn("91+", self.page)
+
+    def test_hitter_evidence_cell_uses_separate_readable_rows(self):
+        self.assertIn("Evidence quality", self.page)
+        self.assertIn("evidence-stack", self.page)
+        self.assertIn("Bullpen ${pct(bullpen.modeled_weight)} modeled", self.page)
+
+    def test_prior_dominated_pitch_cells_are_labeled_explicitly(self):
+        self.assertIn("read.label==='prior-driven'?'Prior-driven'", self.page)
+
+    def test_unstable_hitter_signals_have_explicit_red_risk_treatment(self):
+        self.assertIn("function hitterRisk", self.page)
+        self.assertIn("function riskMarkup", self.page)
+        self.assertIn("Risk · Unstable signal", self.page)
+        self.assertIn("risk-banner", self.page)
+        self.assertIn("risk-high", self.page)
+        self.assertIn("Red Risk banner: unstable evidence", self.page)
+        self.assertIn("item.risk.level!=='high'", self.page)
+        self.assertNotIn("false positive", self.page.lower())
+
+    def test_spotlight_fills_open_slots_with_watchlist_batters(self):
+        self.assertIn("watchlistBatters=eligibleBatters.filter(item=>!item.qualified)", self.page)
+        self.assertIn("shownBatters=[...qualifiedBatters,...watchlistBatters].slice(0,6)", self.page)
+
+    def test_overall_tab_keeps_outcome_specific_strong_matchups_visible(self):
+        self.assertIn("hitterOutcome==='overall'?Object.values", self.page)
+        self.assertIn("'All strong matchups'", self.page)
 
     def test_cards_escape_external_text(self):
         self.assertIn("esc(side.pitcher)", self.page)
@@ -81,18 +107,36 @@ class DashboardSpotlightTests(unittest.TestCase):
     def test_pitcher_board_shows_opportunity_and_the_projection_pathway(self):
         self.assertIn("K environment", self.page)
         self.assertIn("Data grade", self.page)
-        self.assertIn("Projection pathway", self.page)
-        self.assertIn("Confirmed-lineup K risk", self.page)
-        self.assertIn("Starter leash", self.page)
-        self.assertIn("K risk", self.page)
+        self.assertIn("How the K projection is built", self.page)
+        self.assertIn("Strikeout rate describes efficiency", self.page)
+        self.assertIn("Expected opportunity", self.page)
+        self.assertIn("kAdjustmentMarkup", self.page)
 
     def test_matchup_adjusted_workload_pathway_and_manual_cap_are_visible(self):
-        self.assertIn("Why ${Number(p.expected_batters_faced).toFixed(1)} expected BF?", self.page)
-        self.assertIn("Lineup patience", self.page)
-        self.assertIn("Matchup early-hook adjustment", self.page)
-        self.assertIn("80% matchup pitch-budget conversion", self.page)
+        self.assertIn("How workload becomes ${Number(p.expected_batters_faced).toFixed(1)} hitters faced", self.page)
+        self.assertIn("pitches per hitter", self.page)
+        self.assertIn("Earlier exit more likely", self.page)
+        self.assertIn("More hitters create more strikeout and out opportunities", self.page)
+
+    def test_pitcher_workload_challenger_is_visible_and_explicitly_shadow(self):
+        self.assertIn("Machine-learning workload challenger · shadow only", self.page)
+        self.assertIn("ML + matchup K distribution", self.page)
+        self.assertIn("ML output required safety limits", self.page)
         self.assertIn("Manual pitch cap", self.page)
         self.assertIn("/api/workload-overrides", self.page)
+
+    def test_pitcher_workload_avoids_unexplained_abbreviations(self):
+        self.assertNotIn("expected BF", self.page)
+        self.assertNotIn("P/BF", self.page)
+        self.assertNotIn("P/PA", self.page)
+        self.assertNotIn(" pp", self.page)
+        self.assertIn("percentage points", self.page)
+
+    def test_bullpen_cards_have_compact_aligned_statuses_and_guidance(self):
+        self.assertIn(".bullpen-list{grid-template-columns:repeat(3,minmax(0,1fr))", self.page)
+        self.assertIn(".readiness-chip{align-self:start;justify-self:end", self.page)
+        self.assertIn("View pitch arsenal and hitter fit", self.page)
+        self.assertIn("How to use this:", self.page)
 
     def test_game_total_and_favorite_are_visible_in_research(self):
         self.assertIn("Game total", self.page)
@@ -115,7 +159,8 @@ class DashboardSpotlightTests(unittest.TestCase):
     def test_batter_spotlight_lists_every_strong_matchup_for_selected_outcome(self):
         self.assertIn('id="allStrongBatterRows"', self.page)
         self.assertIn('id="allStrongBatterTitle"', self.page)
-        self.assertIn("strongBatters=qualifiedBatters.filter(item=>item.opportunity.tier==='strong')", self.page)
+        self.assertIn("const strongBatters=batters.flatMap", self.page)
+        self.assertIn("opportunity?.tier==='strong'&&opportunity?.evidence==='strong'", self.page)
         self.assertIn("strongBatters.map", self.page)
         self.assertNotIn("strongBatters.slice", self.page)
         self.assertIn("No upcoming confirmed-lineup batters have a strong matchup for this outcome yet.", self.page)
@@ -123,12 +168,20 @@ class DashboardSpotlightTests(unittest.TestCase):
     def test_bullpen_readiness_and_full_game_hitter_blend_are_visible(self):
         self.assertIn("Estimated bullpen readiness", self.page)
         self.assertIn("Likely fresh", self.page)
-        self.assertIn("Recent pitches: today", self.page)
+        self.assertIn("Recent workload:", self.page)
         self.assertIn("Hitter fit versus this reliever", self.page)
         self.assertIn("full_game_research||batter.arsenal_research", self.page)
         self.assertIn("Full-game matchup & exposure", self.page)
         self.assertIn("Starter pitch cells remain starter-only", self.page)
         self.assertIn("bullpen_effect", self.page)
+
+    def test_hitter_shadow_probabilities_and_platoon_anchor_are_visible(self):
+        self.assertIn("mlProbabilityMarkup", self.page)
+        self.assertIn("excluded from ranking while in shadow", self.page)
+        self.assertIn("1+ H", self.page)
+        self.assertIn("Exp TB", self.page)
+        self.assertIn("platoon.label", self.page)
+        self.assertIn("evidence_source", self.page)
 
 
 if __name__ == "__main__":

@@ -416,6 +416,103 @@ MIGRATIONS = (
     CREATE TRIGGER IF NOT EXISTS immutable_bullpen_snapshot_update BEFORE UPDATE ON bullpen_snapshots BEGIN SELECT RAISE(ABORT, 'bullpen_snapshots is immutable'); END;
     CREATE TRIGGER IF NOT EXISTS immutable_bullpen_snapshot_delete BEFORE DELETE ON bullpen_snapshots BEGIN SELECT RAISE(ABORT, 'bullpen_snapshots is immutable'); END;
     """),
+    (9, """
+    CREATE TABLE IF NOT EXISTS hitter_ml_examples (
+      feature_version TEXT NOT NULL,
+      game_pk INTEGER NOT NULL,
+      pa_index INTEGER NOT NULL,
+      game_date TEXT NOT NULL,
+      batter_id INTEGER NOT NULL,
+      pitcher_id INTEGER NOT NULL,
+      pitcher_throws TEXT,
+      lineup_order INTEGER,
+      features_json TEXT NOT NULL,
+      hit INTEGER NOT NULL CHECK (hit IN (0, 1)),
+      extra_base_hit INTEGER NOT NULL CHECK (extra_base_hit IN (0, 1)),
+      home_run INTEGER NOT NULL CHECK (home_run IN (0, 1)),
+      strikeout INTEGER NOT NULL CHECK (strikeout IN (0, 1)),
+      total_bases INTEGER NOT NULL,
+      source TEXT NOT NULL DEFAULT 'mlb-gameday-pre-event',
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (feature_version, game_pk, pa_index)
+    );
+    CREATE INDEX IF NOT EXISTS idx_hitter_ml_examples_date
+      ON hitter_ml_examples(feature_version, game_date, game_pk, pa_index);
+    CREATE TRIGGER IF NOT EXISTS immutable_hitter_ml_examples_update BEFORE UPDATE ON hitter_ml_examples BEGIN SELECT RAISE(ABORT, 'hitter_ml_examples is immutable'); END;
+    CREATE TRIGGER IF NOT EXISTS immutable_hitter_ml_examples_delete BEFORE DELETE ON hitter_ml_examples BEGIN SELECT RAISE(ABORT, 'hitter_ml_examples is immutable'); END;
+    """),
+    (10, """
+    CREATE TABLE IF NOT EXISTS ml_feature_snapshots (
+      ml_snapshot_id INTEGER PRIMARY KEY AUTOINCREMENT,
+      captured_at TEXT NOT NULL,
+      scheduled_start TEXT,
+      game_pk INTEGER NOT NULL,
+      player_id INTEGER NOT NULL,
+      player_name TEXT,
+      target TEXT NOT NULL,
+      model_version TEXT NOT NULL,
+      feature_version TEXT NOT NULL,
+      lineup_confirmed INTEGER NOT NULL DEFAULT 0 CHECK (lineup_confirmed IN (0, 1)),
+      features_json TEXT NOT NULL,
+      source TEXT NOT NULL DEFAULT 'diamond-intel-pregame',
+      UNIQUE (game_pk, player_id, target, feature_version)
+    );
+    CREATE INDEX IF NOT EXISTS idx_ml_feature_snapshot_lookup
+      ON ml_feature_snapshots(target, feature_version, game_pk, player_id);
+    CREATE TABLE IF NOT EXISTS settled_player_outcomes (
+      game_pk INTEGER NOT NULL,
+      game_date TEXT,
+      player_id INTEGER NOT NULL,
+      player_name TEXT,
+      target_group TEXT NOT NULL,
+      outcomes_json TEXT NOT NULL,
+      settled_at TEXT NOT NULL,
+      source TEXT NOT NULL,
+      PRIMARY KEY (game_pk, player_id, target_group)
+    );
+    CREATE INDEX IF NOT EXISTS idx_settled_player_outcomes_date
+      ON settled_player_outcomes(target_group, game_date, game_pk);
+    CREATE TABLE IF NOT EXISTS pitcher_game_ml_examples (
+      feature_version TEXT NOT NULL,
+      game_pk INTEGER NOT NULL,
+      game_date TEXT NOT NULL,
+      player_id INTEGER NOT NULL,
+      player_name TEXT,
+      team_id INTEGER,
+      opponent_id INTEGER,
+      features_json TEXT NOT NULL,
+      batters_faced INTEGER NOT NULL,
+      pitches INTEGER NOT NULL,
+      outs INTEGER NOT NULL,
+      strikeouts INTEGER NOT NULL,
+      early_exit INTEGER NOT NULL CHECK (early_exit IN (0, 1)),
+      source TEXT NOT NULL DEFAULT 'mlb-gameday-pre-event',
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (feature_version, game_pk, player_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_pitcher_game_ml_examples_date
+      ON pitcher_game_ml_examples(feature_version, game_date, game_pk);
+    CREATE TABLE IF NOT EXISTS ml_model_registry (
+      registry_id INTEGER PRIMARY KEY AUTOINCREMENT,
+      model_version TEXT NOT NULL,
+      feature_version TEXT NOT NULL,
+      target_group TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      trained_through TEXT,
+      status TEXT NOT NULL,
+      artifact_path TEXT,
+      metrics_json TEXT NOT NULL,
+      UNIQUE (model_version, feature_version, created_at)
+    );
+    CREATE TRIGGER IF NOT EXISTS immutable_ml_feature_snapshots_update BEFORE UPDATE ON ml_feature_snapshots BEGIN SELECT RAISE(ABORT, 'ml_feature_snapshots is immutable'); END;
+    CREATE TRIGGER IF NOT EXISTS immutable_ml_feature_snapshots_delete BEFORE DELETE ON ml_feature_snapshots BEGIN SELECT RAISE(ABORT, 'ml_feature_snapshots is immutable'); END;
+    CREATE TRIGGER IF NOT EXISTS immutable_settled_player_outcomes_update BEFORE UPDATE ON settled_player_outcomes BEGIN SELECT RAISE(ABORT, 'settled_player_outcomes is immutable'); END;
+    CREATE TRIGGER IF NOT EXISTS immutable_settled_player_outcomes_delete BEFORE DELETE ON settled_player_outcomes BEGIN SELECT RAISE(ABORT, 'settled_player_outcomes is immutable'); END;
+    CREATE TRIGGER IF NOT EXISTS immutable_pitcher_game_ml_examples_update BEFORE UPDATE ON pitcher_game_ml_examples BEGIN SELECT RAISE(ABORT, 'pitcher_game_ml_examples is immutable'); END;
+    CREATE TRIGGER IF NOT EXISTS immutable_pitcher_game_ml_examples_delete BEFORE DELETE ON pitcher_game_ml_examples BEGIN SELECT RAISE(ABORT, 'pitcher_game_ml_examples is immutable'); END;
+    CREATE TRIGGER IF NOT EXISTS immutable_ml_model_registry_update BEFORE UPDATE ON ml_model_registry BEGIN SELECT RAISE(ABORT, 'ml_model_registry is immutable'); END;
+    CREATE TRIGGER IF NOT EXISTS immutable_ml_model_registry_delete BEFORE DELETE ON ml_model_registry BEGIN SELECT RAISE(ABORT, 'ml_model_registry is immutable'); END;
+    """),
 )
 
 def connect(db_path=None):
