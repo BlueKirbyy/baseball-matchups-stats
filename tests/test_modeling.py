@@ -10,6 +10,7 @@ from modeling import (
     lineup_k_evidence, no_vig_probabilities, park_weather_fit, pitch_mix_evidence,
     pitcher_k_projection, shrunk_rate,
 )
+from park_factors import PARK_FACTORS, venue_factor
 
 
 class ModelingTests(unittest.TestCase):
@@ -296,7 +297,39 @@ class ModelingTests(unittest.TestCase):
         self.assertEqual(good_items["hit"]["score"], bad_items["hit"]["score"])
         self.assertGreater(good_items["total_bases"]["score"], bad_items["total_bases"]["score"])
         self.assertGreater(good_items["home_run"]["score"], bad_items["home_run"]["score"])
-        self.assertIn("Park/weather power", good_items["home_run"]["drivers"][2])
+        self.assertIn("Park/weather HR", good_items["home_run"]["drivers"][2])
+
+    def test_every_current_mlb_venue_has_handed_statcast_factors(self):
+        self.assertEqual(len(PARK_FACTORS), 30)
+        for venue_id, profile in PARK_FACTORS.items():
+            self.assertIsInstance(venue_id, int)
+            for side in ("L", "R"):
+                factor = venue_factor(venue_id, side)
+                self.assertGreater(factor["total_bases_multiplier"], .70)
+                self.assertGreater(factor["home_run_multiplier"], .70)
+
+    def test_coors_uses_empirical_factors_before_directional_geometry(self):
+        result = park_weather_fit({
+            "bat_side": "L", "batted_balls": 391,
+            "sectors": {"LF": .10, "LCF": .10, "CF": .17, "RCF": .23, "RF": .40},
+            "pull_rate": .63,
+        }, {
+            "venue_id": 19, "roof": "Open",
+            "distances": {"LF": 347, "LCF": 390, "CF": 415, "RCF": 375, "RF": 350},
+        }, {"wind": "Wind pending"})
+        self.assertGreater(result["total_bases_multiplier"], 1.10)
+        self.assertGreater(result["home_run_multiplier"], 1.05)
+        self.assertEqual(result["statcast_park_factor"]["bat_side"], "L")
+        self.assertIn("favorable", result["total_bases_label"])
+
+    def test_venue_can_help_total_bases_but_hurt_home_runs(self):
+        result = park_weather_fit({
+            "bat_side": "L", "batted_balls": 150,
+            "sectors": {"LF": .15, "LCF": .18, "CF": .20, "RCF": .22, "RF": .25},
+        }, {"venue_id": 7, "roof": "Open", "distances": {}}, {"wind": "Wind pending"})
+        self.assertGreater(result["total_bases_multiplier"], 1.0)
+        self.assertLess(result["home_run_multiplier"], 1.0)
+        self.assertEqual(result["tone"], "neutral")
 
     def test_bullpen_readiness_penalizes_heavy_and_consecutive_use(self):
         fresh = bullpen_readiness(0, 0, 12, 0)

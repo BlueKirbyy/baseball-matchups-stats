@@ -9,6 +9,7 @@ The current pitcher-strikeout model is an unvalidated research baseline. The app
 - `sync_matchup_data.py`: downloads and caches MLB Gameday feeds, builds current matchup aggregates, and records immutable player-game observations.
 - `analytics_store.py`: SQLite schema plus numbered, non-destructive migrations.
 - `modeling.py`: empirical-Bayes shrinkage, arsenal coverage, directional park/weather fit, bullpen readiness/exposure, pitcher-K workload, count distributions, and market math.
+- `park_factors.py`: versioned, handedness-specific Statcast venue factors for separate total-base and home-run context.
 - `pitcher_ml.py` / `train_pitcher_ml.py`: chronological starter-game features, workload challengers, dependency-free shadow inference, and the workload-driven K distribution.
 - `prediction_store.py`: append-only pregame, market, prediction, and result records.
 - `market_data.py`: sportsbook/pick'em CSV and manual market import.
@@ -93,14 +94,25 @@ builds pitch profiles from the same strictly pregame Gameday history. These are
 workload estimates—not official availability or manager intent.
 
 The sync also saves each hitter's five-sector spray distribution (LF, LCF, CF,
-RCF, RF) by batting side, pitcher hand, and pitch type. The matchup model blends
-that spray profile with the probable pitch mix, venue wall distances, roof
-status, temperature, and directional wind. This is a conservative carry and
-geometry adjustment used only for **total-base** and **home-run** opportunity;
-it does not rewrite historical AVG/SLG or alter hit and strikeout reads. The UI
-shows the multiplier, direction, batter side, sample size, and confidence so
-the adjustment is auditable. Run `python3 sync_statcast.py --all` once after
-upgrading to backfill the new spray table; normal future syncs keep it current.
+RCF, RF) by batting side, pitcher hand, and pitch type. The matchup model starts
+with handedness-specific Baseball Savant Statcast park factors for all 30
+current MLB venues. Standard venues use the 2024-2026 three-year window;
+Sutter Health Park uses 2025-2026 because it lacks a third MLB season. Separate
+home-run and total-base baselines preserve important differences such as parks
+that suppress homers but create extra doubles or triples. Total-base factors
+combine the official 1B/2B/3B/HR indices using fixed league-level total-base
+contribution weights documented in `park_factors.py`.
+
+The hitter's pitch-mix-weighted spray, wall geometry, roof status, temperature,
+and directional wind then make smaller game-specific adjustments. Dimensions
+are deliberately a residual—not the park baseline—because the empirical
+Statcast factors already contain the park's average geometry, altitude, and
+typical conditions. This context is used only for **total-base** and **home-run**
+opportunity; it does not rewrite historical AVG/SLG or alter hit and strikeout
+reads. The UI shows both multipliers, batter side, pull rate, sample size,
+window, and confidence so the adjustment is auditable. Run
+`python3 sync_statcast.py --all` once after upgrading to backfill the spray
+table; normal future syncs keep it current.
 
 For an old game, the target game itself and later dates are excluded. Cached feeds are raw source responses; prediction features still apply the as-of cutoff.
 

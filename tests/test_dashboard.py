@@ -155,11 +155,12 @@ class DashboardSpotlightTests(unittest.TestCase):
 
     def test_directional_park_and_weather_fit_is_visible_and_scoped(self):
         self.assertIn("function environmentMarkup", self.page)
-        self.assertIn("Park/weather ${Number(environment.multiplier||1).toFixed(2)}×", self.page)
-        self.assertIn("Park geometry", self.page)
+        self.assertIn("environment.total_bases_multiplier", self.page)
+        self.assertIn("environment.home_run_multiplier", self.page)
+        self.assertIn("Park factors & geometry", self.page)
         self.assertIn("context.park?.dimensions", self.page)
-        self.assertIn("modify only total-base and home-run opportunity", self.page)
-        self.assertIn("do not rewrite historical AVG/SLG", self.page)
+        self.assertIn("separate total-base and home-run baselines", self.page)
+        self.assertIn("Historical AVG/SLG and strikeout calculations are not rewritten", self.page)
 
     def test_batter_spotlight_has_outcome_specific_opportunities(self):
         self.assertIn("Best hitter opportunities", self.page)

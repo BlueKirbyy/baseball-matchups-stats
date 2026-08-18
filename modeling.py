@@ -10,6 +10,7 @@ from math import erf, exp, floor, isfinite, lgamma, log, sqrt
 from statistics import median
 import re
 
+from park_factors import venue_factor
 from pitcher_ml import shadow_workload_prediction
 
 MODEL_VERSION = "pitcher-k-workload-v4"
@@ -1191,11 +1192,13 @@ NEUTRAL_PARK_DISTANCES = {"LF": 330.0, "LCF": 375.0, "CF": 400.0, "RCF": 375.0, 
 
 
 def park_weather_fit(spray_profile, park, weather):
-    """Estimate a capped directional power modifier for today's environment.
+    """Estimate outcome-specific park and weather modifiers.
 
-    This is not a physics simulation and does not rewrite historical results.
-    It combines broad spray sectors, available wall distances, and directional
-    weather into a transparent contextual multiplier for power outcomes only.
+    Handedness-specific multi-year Statcast park factors establish the venue
+    baseline. Broad spray sectors and wall dimensions provide only a small
+    player-specific residual so dimensions are not double-counted. Directional
+    wind and temperature are then applied as game-day overlays. Historical
+    hitter results are never rewritten.
     """
     spray_profile = spray_profile or {}
     park = park or {}
@@ -1208,8 +1211,16 @@ def park_weather_fit(spray_profile, park, weather):
     sectors = {sector: max(0.0, _number(sectors.get(sector), 0.0)) / sector_total for sector in FIELD_SECTORS}
     batted_balls = max(0.0, _number(spray_profile.get("batted_balls"), 0.0))
 
+    empirical = venue_factor(park.get("venue_id"), spray_profile.get("bat_side"))
+    empirical_total_bases_effect = (
+        empirical["total_bases_multiplier"] - 1.0 if empirical else 0.0
+    )
+    empirical_home_run_effect = (
+        empirical["home_run_multiplier"] - 1.0 if empirical else 0.0
+    )
+
     distances = park.get("distances") or {}
-    distance_effect = 0.0
+    raw_distance_effect = 0.0
     dimension_count = 0
     for sector in FIELD_SECTORS:
         distance = _number(distances.get(sector))
@@ -1217,7 +1228,11 @@ def park_weather_fit(spray_profile, park, weather):
             continue
         dimension_count += 1
         neutral = NEUTRAL_PARK_DISTANCES[sector]
-        distance_effect += sectors[sector] * clamp((neutral - distance) / neutral * 1.20, -.08, .08)
+        raw_distance_effect += sectors[sector] * clamp((neutral - distance) / neutral * 1.20, -.08, .08)
+    # Statcast already captures the park's average geometry. This residual only
+    # asks whether this hitter's directional spray fits that geometry unusually
+    # well or poorly. Unknown venues retain a larger dimension-only fallback.
+    dimension_effect = clamp(raw_distance_effect * (.25 if empirical else .65), -.025, .025)
 
     roof = str(park.get("roof") or "").lower()
     weather_limited = roof not in {"open", "unknown", "outdoor"} and bool(roof)
@@ -1240,8 +1255,19 @@ def park_weather_fit(spray_profile, park, weather):
         0.0 if weather_limited or temperature is None
         else clamp((temperature - 72.0) * .0015, -.03, .03)
     )
-    total_effect = clamp(distance_effect + wind_effect + temperature_effect, -.15, .15)
-    multiplier = 1.0 + total_effect
+    total_bases_effect = clamp(
+        empirical_total_bases_effect
+        + .35 * dimension_effect
+        + .55 * wind_effect
+        + .50 * temperature_effect,
+        -.20, .20,
+    )
+    home_run_effect = clamp(
+        empirical_home_run_effect + dimension_effect + wind_effect + temperature_effect,
+        -.20, .20,
+    )
+    total_bases_multiplier = 1.0 + total_bases_effect
+    home_run_multiplier = 1.0 + home_run_effect
 
     if batted_balls >= 100 and dimension_count >= 4 and (weather_limited or wind_speed_match):
         confidence = "strong"
@@ -1249,19 +1275,34 @@ def park_weather_fit(spray_profile, park, weather):
         confidence = "usable"
     else:
         confidence = "limited"
-    available = batted_balls > 0 and dimension_count >= 3
+    available = bool(empirical) or (batted_balls > 0 and dimension_count >= 3)
     if not available:
-        multiplier, total_effect, confidence = 1.0, 0.0, "limited"
+        total_bases_multiplier = home_run_multiplier = 1.0
+        total_bases_effect = home_run_effect = 0.0
+        confidence = "limited"
 
-    if total_effect >= .045:
-        label, tone = "favorable power environment", "good"
-    elif total_effect <= -.045:
-        label, tone = "suppressive power environment", "bad"
+    def outcome_label(effect, outcome):
+        if effect >= .045:
+            return f"favorable {outcome} environment", "good"
+        if effect <= -.045:
+            return f"suppressive {outcome} environment", "bad"
+        return f"neutral {outcome} environment", "neutral"
+
+    total_bases_label, total_bases_tone = outcome_label(total_bases_effect, "total-base")
+    home_run_label, home_run_tone = outcome_label(home_run_effect, "home-run")
+    if total_bases_tone == home_run_tone:
+        label = total_bases_label if total_bases_tone != "neutral" else "neutral power environment"
+        tone = total_bases_tone
     else:
-        label, tone = "neutral power environment", "neutral"
+        label, tone = "mixed park effects by outcome", "neutral"
     factors = []
+    if empirical:
+        factors.append(
+            f"Statcast {empirical['years']} · TB {empirical['total_bases_index']:.0f} · "
+            f"HR {empirical['home_run_index']:.0f} ({empirical['bat_side']}HB)"
+        )
     if dimension_count:
-        factors.append(f"Directional wall fit {distance_effect:+.1%}")
+        factors.append(f"Directional wall residual {dimension_effect:+.1%}")
     if weather_limited:
         factors.append("Roof limits weather impact")
     elif wind_sign and target:
@@ -1274,9 +1315,23 @@ def park_weather_fit(spray_profile, park, weather):
         "available": available,
         "label": label,
         "tone": tone,
-        "multiplier": round(multiplier, 3),
-        "effect": round(total_effect, 3),
-        "park_effect": round(distance_effect, 3),
+        # Legacy aliases intentionally point at the total-base context. New
+        # consumers should use the outcome-specific fields below.
+        "multiplier": round(total_bases_multiplier, 3),
+        "effect": round(total_bases_effect, 3),
+        "total_bases_multiplier": round(total_bases_multiplier, 3),
+        "total_bases_effect": round(total_bases_effect, 3),
+        "total_bases_label": total_bases_label,
+        "total_bases_tone": total_bases_tone,
+        "home_run_multiplier": round(home_run_multiplier, 3),
+        "home_run_effect": round(home_run_effect, 3),
+        "home_run_label": home_run_label,
+        "home_run_tone": home_run_tone,
+        "statcast_park_factor": empirical,
+        "statcast_total_bases_effect": round(empirical_total_bases_effect, 3),
+        "statcast_home_run_effect": round(empirical_home_run_effect, 3),
+        "park_effect": round(dimension_effect, 3),
+        "raw_dimension_effect": round(raw_distance_effect, 3),
         "wind_effect": round(wind_effect, 3),
         "temperature_effect": round(temperature_effect, 3),
         "wind_target": target,
@@ -1289,7 +1344,7 @@ def park_weather_fit(spray_profile, park, weather):
         "opposite_rate": _number(spray_profile.get("opposite_rate")),
         "sectors": {sector: round(sectors[sector], 4) for sector in FIELD_SECTORS},
         "factors": factors,
-        "method": "directional park/weather proxy v1",
+        "method": "statcast venue + directional weather v2",
     }
 
 
@@ -1324,9 +1379,16 @@ def hitter_opportunity_reads(batter, metrics, market_context):
     starter_quality = metrics.get("starter_quality") or {}
     starter_adjustment = _number(starter_quality.get("score_adjustment"), 0.0)
     environment = metrics.get("environment") or {}
-    environment_effect = _number(environment.get("effect"), 0.0) if environment.get("available") else 0.0
-    power_environment_adjustment = clamp(environment_effect / .10 * .20, -.30, .30)
-    home_run_environment_adjustment = clamp(environment_effect / .10 * .45, -.60, .60)
+    total_bases_environment_effect = (
+        _number(environment.get("total_bases_effect"), _number(environment.get("effect"), 0.0))
+        if environment.get("available") else 0.0
+    )
+    home_run_environment_effect = (
+        _number(environment.get("home_run_effect"), _number(environment.get("effect"), 0.0))
+        if environment.get("available") else 0.0
+    )
+    power_environment_adjustment = clamp(total_bases_environment_effect / .10 * .20, -.30, .30)
+    home_run_environment_adjustment = clamp(home_run_environment_effect / .10 * .45, -.60, .60)
     platoon = metrics.get("platoon") or {}
     platoon_ab = max(0.0, _number(platoon.get("at_bats"), 0.0))
     platoon_reliability = platoon_ab / (platoon_ab + 120.0) if platoon_ab else 0.0
@@ -1455,8 +1517,19 @@ def hitter_opportunity_reads(batter, metrics, market_context):
         f"Starter quality {starter_quality.get('label')} ({starter_adjustment:+.2f})"
         if starter_quality.get("available") else "Starter quality pending"
     )
+    total_bases_environment_driver = (
+        f"Park/weather TB {environment.get('total_bases_multiplier', environment.get('multiplier', 1.0)):.2f}× · "
+        f"{environment.get('total_bases_label', environment.get('label', 'neutral'))}"
+        if environment.get("available") else "Park/weather directional profile pending"
+    )
+    home_run_environment_driver = (
+        f"Park/weather HR {environment.get('home_run_multiplier', environment.get('multiplier', 1.0)):.2f}× · "
+        f"{environment.get('home_run_label', environment.get('label', 'neutral'))}"
+        if environment.get("available") else "Park/weather directional profile pending"
+    )
     environment_driver = (
-        f"Park/weather power {environment.get('multiplier', 1.0):.2f}× · {environment.get('label', 'neutral')}"
+        f"Park/weather TB {environment.get('total_bases_multiplier', environment.get('multiplier', 1.0)):.2f}× · "
+        f"HR {environment.get('home_run_multiplier', environment.get('multiplier', 1.0)):.2f}×"
         if environment.get("available") else "Park/weather directional profile pending"
     )
     opportunities = {
@@ -1470,14 +1543,14 @@ def hitter_opportunity_reads(batter, metrics, market_context):
             "total_bases", "Total-base power", power_score,
             f"{expected_slg:.3f} matchup SLG",
             [f"Matchup SLG {expected_slg:.3f} vs {LEAGUE_HITTER_SLG:.3f} MLB",
-             f"Matchup ISO {expected_iso:.3f}", environment_driver],
+             f"Matchup ISO {expected_iso:.3f}", total_bases_environment_driver],
             [*quality_risks, *environment_risks],
         ),
         "home_run": build(
             "home_run", "Home-run power", home_run_score,
             f"{expected_iso:.3f} matchup ISO",
             [f"Matchup ISO {expected_iso:.3f} vs {LEAGUE_HITTER_ISO:.3f} MLB",
-             f"Barrel proxy {barrel_rate:.1%}", environment_driver],
+             f"Barrel proxy {barrel_rate:.1%}", home_run_environment_driver],
             [*quality_risks, *environment_risks],
         ),
         "runs_rbi": build(
@@ -1651,7 +1724,8 @@ def blend_full_game_hitter_matchup(batter, starter_summary, bullpen_entries,
     starter_k_rate = hitter_k_risk(batter.get("k_profile"))["posterior"]
     bullpen_k_rate = LEAGUE_K_RATE
     starter_environment = starter.get("environment") or {}
-    bullpen_environment_effect = 0.0
+    bullpen_total_bases_environment_effect = 0.0
+    bullpen_home_run_environment_effect = 0.0
     bullpen_environment_sample = 0.0
     modeled_weight = 0.0
     mix = []
@@ -1665,7 +1739,14 @@ def blend_full_game_hitter_matchup(batter, starter_summary, bullpen_entries,
             bullpen_k_rate += normalized * (reliever_k - LEAGUE_K_RATE)
             reliever_environment = summary.get("environment") or {}
             if reliever_environment.get("available"):
-                bullpen_environment_effect += normalized * _number(reliever_environment.get("effect"), 0.0)
+                bullpen_total_bases_environment_effect += normalized * _number(
+                    reliever_environment.get("total_bases_effect"),
+                    _number(reliever_environment.get("effect"), 0.0),
+                )
+                bullpen_home_run_environment_effect += normalized * _number(
+                    reliever_environment.get("home_run_effect"),
+                    _number(reliever_environment.get("effect"), 0.0),
+                )
                 bullpen_environment_sample += normalized * _number(reliever_environment.get("batted_balls"), 0.0)
             for metric, default in metric_defaults.items():
                 value = _number(summary.get(metric), default)
@@ -1700,23 +1781,61 @@ def blend_full_game_hitter_matchup(batter, starter_summary, bullpen_entries,
     result["market_context"] = market_context
     result["platoon"] = starter.get("platoon") or batter.get("platoon") or {}
     result["platoon_disagreement"] = bool(starter.get("platoon_disagreement"))
-    starter_environment_effect = _number(starter_environment.get("effect"), 0.0) if starter_environment.get("available") else 0.0
-    blended_environment_effect = starter_share * starter_environment_effect + bullpen_share * bullpen_environment_effect
-    if blended_environment_effect >= .045:
-        environment_label, environment_tone = "favorable power environment", "good"
-    elif blended_environment_effect <= -.045:
-        environment_label, environment_tone = "suppressive power environment", "bad"
+    starter_total_bases_environment_effect = (
+        _number(starter_environment.get("total_bases_effect"), _number(starter_environment.get("effect"), 0.0))
+        if starter_environment.get("available") else 0.0
+    )
+    starter_home_run_environment_effect = (
+        _number(starter_environment.get("home_run_effect"), _number(starter_environment.get("effect"), 0.0))
+        if starter_environment.get("available") else 0.0
+    )
+    blended_total_bases_environment_effect = (
+        starter_share * starter_total_bases_environment_effect
+        + bullpen_share * bullpen_total_bases_environment_effect
+    )
+    blended_home_run_environment_effect = (
+        starter_share * starter_home_run_environment_effect
+        + bullpen_share * bullpen_home_run_environment_effect
+    )
+
+    def blended_environment_label(effect, outcome):
+        if effect >= .045:
+            return f"favorable {outcome} environment", "good"
+        if effect <= -.045:
+            return f"suppressive {outcome} environment", "bad"
+        return f"neutral {outcome} environment", "neutral"
+
+    total_bases_environment_label, total_bases_environment_tone = blended_environment_label(
+        blended_total_bases_environment_effect, "total-base",
+    )
+    home_run_environment_label, home_run_environment_tone = blended_environment_label(
+        blended_home_run_environment_effect, "home-run",
+    )
+    if total_bases_environment_tone == home_run_environment_tone:
+        environment_label = (
+            total_bases_environment_label
+            if total_bases_environment_tone != "neutral" else "neutral power environment"
+        )
+        environment_tone = total_bases_environment_tone
     else:
-        environment_label, environment_tone = "neutral power environment", "neutral"
+        environment_label, environment_tone = "mixed park effects by outcome", "neutral"
     result["environment"] = {
         **starter_environment,
         "available": bool(starter_environment.get("available")) or bullpen_environment_sample > 0,
-        "effect": round(blended_environment_effect, 3),
-        "multiplier": round(1.0 + blended_environment_effect, 3),
+        "effect": round(blended_total_bases_environment_effect, 3),
+        "multiplier": round(1.0 + blended_total_bases_environment_effect, 3),
+        "total_bases_effect": round(blended_total_bases_environment_effect, 3),
+        "total_bases_multiplier": round(1.0 + blended_total_bases_environment_effect, 3),
+        "total_bases_label": total_bases_environment_label,
+        "total_bases_tone": total_bases_environment_tone,
+        "home_run_effect": round(blended_home_run_environment_effect, 3),
+        "home_run_multiplier": round(1.0 + blended_home_run_environment_effect, 3),
+        "home_run_label": home_run_environment_label,
+        "home_run_tone": home_run_environment_tone,
         "label": environment_label,
         "tone": environment_tone,
         "batted_balls": int(_number(starter_environment.get("batted_balls"), 0.0) + bullpen_environment_sample),
-        "method": "starter/bullpen directional park-weather blend v1",
+        "method": "starter/bullpen Statcast park-weather blend v2",
     }
     result["starter_quality"] = hitter_starter_quality_context(starter_performance, starter_share)
     result["strong_evidence"] = hitter_strong_evidence(result)

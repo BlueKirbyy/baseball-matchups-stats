@@ -9,6 +9,7 @@ from urllib.request import urlopen
 from analytics_store import connect, initialize
 from market_data import normalize_row
 from hitter_ml import shadow_prediction
+from park_factors import venue_factor
 from modeling import (
     HITTER_PLATOON_PRIOR_PA, LEAGUE_HITTER_AVERAGE, LEAGUE_HITTER_SLG,
     blend_full_game_hitter_matchup, hitter_arsenal_summary, hitter_k_risk,
@@ -423,6 +424,13 @@ def game_context(feed, db, season):
         geometry.append("short corner dimensions")
     if distances.get("CF", 0) >= 410:
         geometry.append("spacious center field")
+    empirical_park = venue_factor(venue.get("id"), None)
+    if empirical_park:
+        geometry.append(
+            f"Statcast {empirical_park['years']} baseline: "
+            f"TB {empirical_park['total_bases_multiplier']:.2f}× / "
+            f"HR {empirical_park['home_run_multiplier']:.2f}×"
+        )
     weather = feed.get("gameData", {}).get("weather", {})
     wind = weather.get("wind", "")
     temperature = weather.get("temp")
@@ -454,7 +462,7 @@ def game_context(feed, db, season):
             umpire = {"name": home_plate.get("fullName", "Home plate umpire"), "tendency": tendency, "games": games, "k_rate": k_rate, "bb_rate": bb_rate, "league_k_rate": league_k, "league_bb_rate": league_bb, "status": f"Based on {games} cached regular-season games."}
         else:
             umpire = {"name": home_plate.get("fullName", "Home plate umpire"), "status": f"Limited cached sample ({games} games); no tendency label yet."}
-    return {"park": {"name": venue.get("name", "Park TBD"), "venue_id": venue.get("id"), "roof": roof, "turf": field.get("turfType", "Unknown"), "dimensions": dimensions or "Dimensions unavailable", "distances": distances, "read": "; ".join(geometry) or "Standard geometry context"}, "weather": {"condition": weather.get("condition", "Weather pending"), "temp": temperature, "wind": wind or "Wind pending", "read": "; ".join(weather_read) or "Weather impact pending"}, "umpire": umpire}
+    return {"park": {"name": venue.get("name", "Park TBD"), "venue_id": venue.get("id"), "roof": roof, "turf": field.get("turfType", "Unknown"), "dimensions": dimensions or "Dimensions unavailable", "distances": distances, "park_factor": empirical_park, "read": "; ".join(geometry) or "Standard geometry context"}, "weather": {"condition": weather.get("condition", "Weather pending"), "temp": temperature, "wind": wind or "Wind pending", "read": "; ".join(weather_read) or "Weather impact pending"}, "umpire": umpire}
 
 
 def hitter_spray_profile(db, season, batter_id, bat_side, pitcher_throws, arsenal):
