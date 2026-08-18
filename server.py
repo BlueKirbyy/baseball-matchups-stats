@@ -12,7 +12,8 @@ from hitter_ml import shadow_prediction
 from modeling import (
     HITTER_PLATOON_PRIOR_PA, LEAGUE_HITTER_AVERAGE, LEAGUE_HITTER_SLG,
     blend_full_game_hitter_matchup, hitter_arsenal_summary, hitter_k_risk,
-    hitter_market_context, hitter_pitch_summary, pitcher_k_projection, shrunk_rate,
+    hitter_market_context, hitter_pitch_summary, park_weather_fit,
+    pitcher_k_projection, shrunk_rate,
 )
 from prediction_store import (
     add_market_snapshot, add_workload_override, latest_bullpen_snapshot,
@@ -222,6 +223,7 @@ def summarize_espn_odds(rows, home, away):
     """
     totals, over_prices, under_prices = [], [], []
     home_probs, away_probs, providers = [], [], set()
+    home_favorite_votes, away_favorite_votes = 0, 0
     for odds in rows if isinstance(rows, list) else []:
         if not isinstance(odds, dict):
             continue
@@ -239,8 +241,28 @@ def summarize_espn_odds(rows, home, away):
             under_prices.append(under_price)
         home_odds = odds.get("homeTeamOdds", {})
         away_odds = odds.get("awayTeamOdds", {})
-        home_probability = implied_probability(home_odds.get("moneyLine")) if isinstance(home_odds, dict) else None
-        away_probability = implied_probability(away_odds.get("moneyLine")) if isinstance(away_odds, dict) else None
+        if isinstance(home_odds, dict) and home_odds.get("favorite") is True:
+            home_favorite_votes += 1
+        if isinstance(away_odds, dict) and away_odds.get("favorite") is True:
+            away_favorite_votes += 1
+
+        def moneyline(team_odds):
+            if not isinstance(team_odds, dict):
+                return None
+            candidates = [team_odds]
+            candidates.extend(
+                team_odds.get(key) for key in ("current", "close", "open")
+                if isinstance(team_odds.get(key), dict)
+            )
+            for candidate in candidates:
+                for key in ("moneyLine", "moneyline", "american", "odds"):
+                    value = number(candidate.get(key))
+                    if value is not None and value != 0:
+                        return value
+            return None
+
+        home_probability = implied_probability(moneyline(home_odds))
+        away_probability = implied_probability(moneyline(away_odds))
         if home_probability is not None:
             home_probs.append(home_probability)
         if away_probability is not None:
@@ -248,9 +270,21 @@ def summarize_espn_odds(rows, home, away):
     home_probability, away_probability = median(home_probs), median(away_probs)
     favorite = None
     if home_probability is not None and away_probability is not None:
+        probability_sum = home_probability + away_probability
+        fair_home = home_probability / probability_sum if probability_sum else home_probability
+        fair_away = away_probability / probability_sum if probability_sum else away_probability
         favorite = {
-            "team": home if home_probability >= away_probability else away,
-            "probability": max(home_probability, away_probability),
+            "team": home if fair_home >= fair_away else away,
+            "probability": max(fair_home, fair_away),
+        }
+    elif home_favorite_votes != away_favorite_votes:
+        # Some ESPN providers expose only the favorite flag, not a moneyline.
+        # Use a deliberately modest default edge so team-run allocation still
+        # has direction without pretending an unavailable price is known.
+        favorite = {
+            "team": home if home_favorite_votes > away_favorite_votes else away,
+            "probability": .55,
+            "probability_source": "favorite flag; price unavailable",
         }
     if not totals and not favorite:
         return None
@@ -375,14 +409,19 @@ def game_context(feed, db, season):
     venue = feed.get("gameData", {}).get("venue", {})
     field = venue.get("fieldInfo", {})
     roof = field.get("roofType") or "Unknown"
-    left, center, right = field.get("leftLine"), field.get("center"), field.get("rightLine")
-    dimensions = " / ".join(f"{distance} ft" for distance in (left, center, right) if distance)
+    distance_fields = {
+        "LF": field.get("leftLine"), "LCF": field.get("leftCenter"),
+        "CF": field.get("center"), "RCF": field.get("rightCenter"),
+        "RF": field.get("rightLine"),
+    }
+    distances = {sector: number(distance) for sector, distance in distance_fields.items() if number(distance) is not None}
+    dimensions = " / ".join(f"{sector} {distance:.0f} ft" for sector, distance in distances.items())
     geometry = []
     if roof.lower() != "open":
         geometry.append(f"{roof} roof limits weather impact")
-    if any(distance and distance <= 315 for distance in (left, right)):
+    if any(distances.get(sector, 999) <= 315 for sector in ("LF", "RF")):
         geometry.append("short corner dimensions")
-    if center and center >= 410:
+    if distances.get("CF", 0) >= 410:
         geometry.append("spacious center field")
     weather = feed.get("gameData", {}).get("weather", {})
     wind = weather.get("wind", "")
@@ -415,7 +454,87 @@ def game_context(feed, db, season):
             umpire = {"name": home_plate.get("fullName", "Home plate umpire"), "tendency": tendency, "games": games, "k_rate": k_rate, "bb_rate": bb_rate, "league_k_rate": league_k, "league_bb_rate": league_bb, "status": f"Based on {games} cached regular-season games."}
         else:
             umpire = {"name": home_plate.get("fullName", "Home plate umpire"), "status": f"Limited cached sample ({games} games); no tendency label yet."}
-    return {"park": {"name": venue.get("name", "Park TBD"), "roof": roof, "turf": field.get("turfType", "Unknown"), "dimensions": dimensions or "Dimensions unavailable", "read": "; ".join(geometry) or "Standard geometry context"}, "weather": {"condition": weather.get("condition", "Weather pending"), "temp": temperature, "wind": wind or "Wind pending", "read": "; ".join(weather_read) or "Weather impact pending"}, "umpire": umpire}
+    return {"park": {"name": venue.get("name", "Park TBD"), "venue_id": venue.get("id"), "roof": roof, "turf": field.get("turfType", "Unknown"), "dimensions": dimensions or "Dimensions unavailable", "distances": distances, "read": "; ".join(geometry) or "Standard geometry context"}, "weather": {"condition": weather.get("condition", "Weather pending"), "temp": temperature, "wind": wind or "Wind pending", "read": "; ".join(weather_read) or "Weather impact pending"}, "umpire": umpire}
+
+
+def hitter_spray_profile(db, season, batter_id, bat_side, pitcher_throws, arsenal):
+    """Build a pitch-mix-weighted physical-field spray profile.
+
+    Exact batter-side and pitcher-hand rows are preferred. Thin hand samples
+    fall back to the batter's same-side spray history and are shrunk toward the
+    overall five-sector distribution.
+    """
+    if bat_side == "S":
+        expected_side = "L" if pitcher_throws == "R" else "R" if pitcher_throws == "L" else "S"
+    else:
+        expected_side = bat_side or "U"
+    query = """SELECT bat_side, pitcher_throws, pitch_code, sector, batted_balls,
+                      hard_hits, barrel_proxy, home_runs, exit_velocity_sum,
+                      launch_angle_sum
+                 FROM gameday_batter_spray
+                WHERE season=? AND player_id=?"""
+    rows = [dict(row) for row in db.execute(
+        query + (" AND bat_side=?" if expected_side != "U" else ""),
+        (season, batter_id, expected_side) if expected_side != "U" else (season, batter_id),
+    )]
+    if not rows and expected_side != "U":
+        rows = [dict(row) for row in db.execute(query, (season, batter_id))]
+        expected_side = "U"
+    if expected_side == "U" and rows:
+        hand_rows = [row for row in rows if row["pitcher_throws"] == pitcher_throws]
+        inference_pool = hand_rows if sum(row["batted_balls"] for row in hand_rows) >= 10 else rows
+        side_counts = {
+            side: sum(row["batted_balls"] for row in inference_pool if row["bat_side"] == side)
+            for side in ("L", "R")
+        }
+        inferred_side = max(side_counts, key=side_counts.get)
+        if side_counts[inferred_side] > 0:
+            expected_side = inferred_side
+            rows = [row for row in rows if row["bat_side"] == expected_side]
+    exact = [row for row in rows if row["pitcher_throws"] == pitcher_throws]
+    exact_count = sum(row["batted_balls"] for row in exact)
+    selected = exact if exact_count >= 35 else rows
+    side_label = f"{expected_side}HB" if expected_side != "U" else "all batter sides"
+    source = f"{side_label} vs {pitcher_throws}HP" if exact_count >= 35 else f"{side_label} all-pitcher-hand fallback"
+    sectors = ("LF", "LCF", "CF", "RCF", "RF")
+    total_batted_balls = sum(row["batted_balls"] for row in selected)
+    if not total_batted_balls:
+        return {
+            "available": False, "bat_side": expected_side, "source": "spray data pending",
+            "batted_balls": 0, "sectors": {sector: .2 for sector in sectors},
+            "pull_rate": None, "center_rate": None, "opposite_rate": None,
+        }
+    overall_counts = {sector: sum(row["batted_balls"] for row in selected if row["sector"] == sector) for sector in sectors}
+    overall_shares = {sector: overall_counts[sector] / total_batted_balls for sector in sectors}
+    by_pitch = {}
+    for row in selected:
+        by_pitch.setdefault(row["pitch_code"], {sector: 0 for sector in sectors})
+        by_pitch[row["pitch_code"]][row["sector"]] += row["batted_balls"]
+    weighted = {sector: 0.0 for sector in sectors}
+    total_usage = sum(max(0.0, number(pitch.get("usage")) or 0.0) for pitch in arsenal) or 100.0
+    for pitch in arsenal:
+        usage = max(0.0, number(pitch.get("usage")) or 0.0) / total_usage
+        counts = by_pitch.get(pitch.get("code")) or {}
+        pitch_total = sum(counts.values())
+        for sector in sectors:
+            share = (counts.get(sector, 0) + 25.0 * overall_shares[sector]) / (pitch_total + 25.0)
+            weighted[sector] += usage * share
+    weighted_total = sum(weighted.values()) or 1.0
+    weighted = {sector: weighted[sector] / weighted_total for sector in sectors}
+    if expected_side == "L":
+        pull = weighted["RCF"] + weighted["RF"]
+        opposite = weighted["LF"] + weighted["LCF"]
+    elif expected_side == "R":
+        pull = weighted["LF"] + weighted["LCF"]
+        opposite = weighted["RCF"] + weighted["RF"]
+    else:
+        pull = opposite = None
+    return {
+        "available": True, "bat_side": expected_side, "source": source,
+        "batted_balls": total_batted_balls, "exact_hand_batted_balls": exact_count,
+        "sectors": weighted, "pull_rate": pull, "center_rate": weighted["CF"],
+        "opposite_rate": opposite,
+    }
 
 
 def saved_pitcher_arsenal(db, player_id, season):
@@ -548,7 +667,7 @@ def hitter_platoon_profile(db, season, batter_id, pitcher_throws):
 
 
 def hitter_profile_for_pitcher(db, season, batter, pitcher_id, arsenal,
-                               pitcher_throws, market_context):
+                               pitcher_throws, market_context, game_environment=None):
     """Build the same pitch/velocity/context hitter evidence for any pitcher."""
     batter_id = batter["id"]
     codes = [pitch["code"] for pitch in arsenal[:5]]
@@ -700,6 +819,14 @@ def hitter_profile_for_pitcher(db, season, batter, pitcher_id, arsenal,
         "platoon": platoon,
         "k_profile": hitter_k_profile_for_hand(db, season, batter_id, pitcher_throws),
     }
+    spray = hitter_spray_profile(
+        db, season, batter_id, hitter.get("bat_side"), pitcher_throws, arsenal[:5],
+    )
+    game_environment = game_environment or {}
+    hitter["spray_profile"] = spray
+    hitter["environment"] = park_weather_fit(
+        spray, game_environment.get("park"), game_environment.get("weather"),
+    )
     for stat in by_pitch.values():
         stat["research"] = hitter_pitch_summary(stat, prior={
             "avg": platoon["posterior_avg"], "slg": platoon["posterior_slg"],
@@ -754,7 +881,7 @@ def matchup_research(game_pk):
             hitter_rows = [
                 hitter_profile_for_pitcher(
                     db, season, batter, pitcher["id"], arsenal,
-                    pitcher_throws, market_context,
+                    pitcher_throws, market_context, context,
                 )
                 for batter in hitters
             ]
@@ -809,7 +936,7 @@ def matchup_research(game_pk):
                     for batter in hitters:
                         reliever_hitter = hitter_profile_for_pitcher(
                             db, season, batter, reliever_id, reliever_arsenal,
-                            reliever_hand, market_context,
+                            reliever_hand, market_context, context,
                         )
                         fits[batter["id"]] = {
                             "summary": reliever_hitter["arsenal_research"],
@@ -845,6 +972,7 @@ def matchup_research(game_pk):
                 hitter["full_game_research"] = blend_full_game_hitter_matchup(
                     hitter, hitter["arsenal_research"], bullpen_entries,
                     expected_bf, bf_interval, market_context,
+                    (projection.get("performance_outlook") or {}),
                 )
                 try:
                     hitter["ml_research"] = shadow_prediction(hitter, side)

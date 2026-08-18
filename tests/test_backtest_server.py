@@ -1,14 +1,41 @@
 import unittest
+from pathlib import Path
+import tempfile
 from datetime import datetime, timedelta, timezone
 
+from analytics_store import connect, initialize
 from backtest import calibration_rows, chronological_splits, evaluate
 from server import (
     Handler, active_slate_date_and_scoreboard, confirmed_starting_lineup,
-    hitter_context_metrics, hitter_power_metrics, local_game_time, odds_ttl_seconds,
+    hitter_context_metrics, hitter_power_metrics, hitter_spray_profile,
+    local_game_time, odds_ttl_seconds, summarize_espn_odds,
 )
 
 
 class BacktestAndServerTests(unittest.TestCase):
+    def test_spray_profile_infers_batting_side_for_lookahead_rosters(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = Path(directory) / "spray.db"
+            initialize(db_path)
+            rows = [
+                (2026, 42, "L", "R", "FF", "LF", 5, 1, 0, 0, 430, 55),
+                (2026, 42, "L", "R", "FF", "CF", 10, 3, 1, 0, 900, 120),
+                (2026, 42, "L", "R", "FF", "RF", 35, 15, 5, 3, 3250, 600),
+                (2026, 42, "R", "L", "FF", "LF", 4, 1, 0, 0, 350, 40),
+            ]
+            with connect(db_path) as db:
+                db.executemany(
+                    """INSERT INTO gameday_batter_spray VALUES
+                       (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    rows,
+                )
+                profile = hitter_spray_profile(
+                    db, 2026, 42, None, "R", [{"code": "FF", "usage": 100}],
+                )
+            self.assertEqual(profile["bat_side"], "L")
+            self.assertGreater(profile["pull_rate"], .5)
+            self.assertEqual(profile["exact_hand_batted_balls"], 50)
+
     def test_local_server_disables_stale_dashboard_caching(self):
         self.assertTrue(any("no-store" in value for value in Handler.end_headers.__code__.co_consts if isinstance(value, str)))
 
@@ -52,6 +79,26 @@ class BacktestAndServerTests(unittest.TestCase):
         now = datetime.now(timezone.utc)
         self.assertEqual(odds_ttl_seconds([{"start_time": (now + timedelta(minutes=10)).isoformat()}]), 60)
         self.assertNotEqual(local_game_time("2026-04-10T23:00:00Z"), "Time TBD")
+
+    def test_espn_odds_nested_moneyline_is_devigged(self):
+        summary = summarize_espn_odds([{
+            "overUnder": 9,
+            "provider": {"name": "Test Book"},
+            "homeTeamOdds": {"current": {"moneyLine": -150}},
+            "awayTeamOdds": {"current": {"moneyLine": 130}},
+        }], "Home Club", "Away Club")
+        self.assertEqual(summary["favorite"]["team"], "Home Club")
+        self.assertGreater(summary["favorite"]["probability"], .5)
+        self.assertLess(summary["favorite"]["probability"], .6)
+
+    def test_espn_favorite_flag_is_used_when_moneyline_is_missing(self):
+        summary = summarize_espn_odds([{
+            "overUnder": 8.5,
+            "homeTeamOdds": {"favorite": True},
+            "awayTeamOdds": {"favorite": False},
+        }], "Home Club", "Away Club")
+        self.assertEqual(summary["favorite"]["team"], "Home Club")
+        self.assertEqual(summary["favorite"]["probability"], .55)
 
     def test_active_slate_stays_today_while_a_local_game_is_unstarted(self):
         calls = []

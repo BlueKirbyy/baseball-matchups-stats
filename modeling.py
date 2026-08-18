@@ -8,6 +8,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from math import erf, exp, floor, isfinite, lgamma, log, sqrt
 from statistics import median
+import re
 
 from pitcher_ml import shadow_workload_prediction
 
@@ -42,6 +43,9 @@ HITTER_RISK_MIN_CONTEXT_COVERAGE = 0.02
 HITTER_RISK_MIN_PLATOON_AB = 50
 HITTER_RISK_MIN_SEASON_PA = 100
 LEAGUE_GAME_TOTAL = 8.5
+LEAGUE_TEAM_RUNS = LEAGUE_GAME_TOTAL / 2.0
+LEAGUE_STARTER_ER9 = 4.30
+LEAGUE_STARTER_WHIP = 1.30
 LEAGUE_PITCHES_PER_PA = 3.9
 LEAGUE_ON_BASE_PROXY = 0.320
 LEAGUE_OUT_RATE = 0.675
@@ -1093,27 +1097,199 @@ def hitter_signal_risk(batter, metrics):
 
 
 def hitter_market_context(market, batting_team):
-    """Return a deliberately modest, transparent game-environment adjustment.
+    """Turn the game market into a conservative team scoring expectation.
 
-    The market total is a useful run-environment proxy and favorite status is a
-    small proxy for team scoring opportunity. Neither turns pitch research into
-    a hit-prop probability, so their combined contribution is capped at five
-    points on the hitter fit scale.
+    A nine-run game does not imply 4.5 runs for both clubs. When a moneyline is
+    available, split the total toward the favorite; this is an explanatory run
+    proxy rather than a sportsbook team-total market. The resulting adjustment
+    remains deliberately small relative to pitch and batted-ball evidence.
     """
     market = market or {}
+    if isinstance(batting_team, dict):
+        batting_team = batting_team.get("name") or batting_team.get("displayName")
+
+    def same_team(left, right):
+        normalize = lambda value: "".join(character for character in str(value or "").lower() if character.isalnum())
+        return bool(normalize(left)) and normalize(left) == normalize(right)
+
     total = _number(market.get("total"))
-    total_adjustment = clamp(((total - LEAGUE_GAME_TOTAL) / 2.5) * .0035, -.0035, .0035) if total is not None else 0.0
     favorite = market.get("favorite") or {}
     favorite_team = favorite.get("team") if isinstance(favorite, dict) else None
-    favorite_adjustment = .0015 if favorite_team and batting_team and favorite_team == batting_team else 0.0
+    favorite_probability = _number(favorite.get("probability")) if isinstance(favorite, dict) else None
+    favorite_probability = clamp(favorite_probability, .50, .80) if favorite_probability is not None else None
+    is_favorite = same_team(favorite_team, batting_team) if favorite_team and batting_team else False
+    team_role = "favorite" if is_favorite else ("underdog" if favorite_team and batting_team else "unknown")
+
+    team_runs = None
+    opponent_runs = None
+    if total is not None:
+        probability = favorite_probability if favorite_probability is not None else (.55 if favorite_team else .50)
+        run_shift = clamp((probability - .50) * total * .50, 0.0, 1.25) if favorite_team else 0.0
+        team_runs = total / 2.0 + run_shift if is_favorite else total / 2.0 - run_shift
+        opponent_runs = total - team_runs
+    total_adjustment = (
+        clamp(((team_runs - LEAGUE_TEAM_RUNS) / 1.25) * .005, -.005, .005)
+        if team_runs is not None else 0.0
+    )
     return {
         "total": total,
         "favorite": favorite_team,
-        "favorite_probability": _number(favorite.get("probability")) if isinstance(favorite, dict) else None,
+        "favorite_probability": favorite_probability,
+        "batting_team": batting_team,
+        "team_role": team_role,
+        "is_favorite": is_favorite,
+        "team_run_expectation": round(team_runs, 2) if team_runs is not None else None,
+        "opponent_run_expectation": round(opponent_runs, 2) if opponent_runs is not None else None,
         "total_adjustment": total_adjustment,
-        "favorite_adjustment": favorite_adjustment,
-        "adjustment": total_adjustment + favorite_adjustment,
+        # Kept for old cached clients; team allocation now lives in total_adjustment.
+        "favorite_adjustment": 0.0,
+        "adjustment": total_adjustment,
         "available": total is not None or favorite_team is not None,
+    }
+
+
+def hitter_starter_quality_context(performance, starter_share=1.0):
+    """Return a capped hitter adjustment from the starter's run prevention.
+
+    ER/9 and WHIP are noisy, so neither is treated as a projection by itself.
+    They are blended, capped, and scaled by the share of plate appearances the
+    hitter is expected to take against the starter.
+    """
+    performance = performance or {}
+    er9 = _number(performance.get("earned_runs_per_nine"))
+    whip = _number(performance.get("whip_history"))
+    components = []
+    if er9 is not None:
+        components.append((.60, clamp((LEAGUE_STARTER_ER9 - er9) / 1.50, -1.0, 1.0)))
+    if whip is not None:
+        components.append((.40, clamp((LEAGUE_STARTER_WHIP - whip) / .25, -1.0, 1.0)))
+    total_weight = sum(weight for weight, _value in components)
+    quality = sum(weight * value for weight, value in components) / total_weight if total_weight else 0.0
+    starter_share = clamp(_number(starter_share, 1.0), 0.0, 1.0)
+    # Positive quality means a tougher starter; hitter score adjustment is inverse.
+    score_adjustment = -0.55 * quality * starter_share
+    if quality >= .30:
+        label, tone = "tough starter", "bad"
+    elif quality <= -.30:
+        label, tone = "vulnerable starter", "good"
+    else:
+        label, tone = "average starter quality", "neutral"
+    return {
+        "quality": round(quality, 3),
+        "score_adjustment": round(score_adjustment, 3),
+        "label": label,
+        "tone": tone,
+        "earned_runs_per_nine": er9,
+        "whip": whip,
+        "starter_share": round(starter_share, 3),
+        "available": bool(components),
+    }
+
+
+FIELD_SECTORS = ("LF", "LCF", "CF", "RCF", "RF")
+NEUTRAL_PARK_DISTANCES = {"LF": 330.0, "LCF": 375.0, "CF": 400.0, "RCF": 375.0, "RF": 330.0}
+
+
+def park_weather_fit(spray_profile, park, weather):
+    """Estimate a capped directional power modifier for today's environment.
+
+    This is not a physics simulation and does not rewrite historical results.
+    It combines broad spray sectors, available wall distances, and directional
+    weather into a transparent contextual multiplier for power outcomes only.
+    """
+    spray_profile = spray_profile or {}
+    park = park or {}
+    weather = weather or {}
+    sectors = spray_profile.get("sectors") or {}
+    sector_total = sum(max(0.0, _number(sectors.get(sector), 0.0)) for sector in FIELD_SECTORS)
+    if sector_total <= 0:
+        sectors = {sector: .20 for sector in FIELD_SECTORS}
+        sector_total = 1.0
+    sectors = {sector: max(0.0, _number(sectors.get(sector), 0.0)) / sector_total for sector in FIELD_SECTORS}
+    batted_balls = max(0.0, _number(spray_profile.get("batted_balls"), 0.0))
+
+    distances = park.get("distances") or {}
+    distance_effect = 0.0
+    dimension_count = 0
+    for sector in FIELD_SECTORS:
+        distance = _number(distances.get(sector))
+        if distance is None:
+            continue
+        dimension_count += 1
+        neutral = NEUTRAL_PARK_DISTANCES[sector]
+        distance_effect += sectors[sector] * clamp((neutral - distance) / neutral * 1.20, -.08, .08)
+
+    roof = str(park.get("roof") or "").lower()
+    weather_limited = roof not in {"open", "unknown", "outdoor"} and bool(roof)
+    wind_text = str(weather.get("wind") or "")
+    wind_speed_match = re.search(r"(\d+(?:\.\d+)?)\s*mph", wind_text, re.IGNORECASE)
+    wind_speed = clamp(_number(wind_speed_match.group(1), 0.0), 0.0, 25.0) if wind_speed_match else 0.0
+    upper_wind = wind_text.upper().replace("RIGHT", "RF").replace("LEFT", "LF").replace("CENTER", "CF")
+    wind_sign = 1.0 if "OUT TO" in upper_wind else -1.0 if "IN FROM" in upper_wind else 0.0
+    target = next((sector for sector in ("RCF", "LCF", "RF", "LF", "CF") if sector in upper_wind), None)
+    target_index = FIELD_SECTORS.index(target) if target else None
+    directional_share = 0.0
+    if target_index is not None:
+        for index, sector in enumerate(FIELD_SECTORS):
+            distance = abs(index - target_index)
+            directional_share += sectors[sector] * (1.0 if distance == 0 else .45 if distance == 1 else 0.0)
+    wind_effect = 0.0 if weather_limited else wind_sign * wind_speed * .004 * directional_share
+
+    temperature = _number(weather.get("temp"))
+    temperature_effect = (
+        0.0 if weather_limited or temperature is None
+        else clamp((temperature - 72.0) * .0015, -.03, .03)
+    )
+    total_effect = clamp(distance_effect + wind_effect + temperature_effect, -.15, .15)
+    multiplier = 1.0 + total_effect
+
+    if batted_balls >= 100 and dimension_count >= 4 and (weather_limited or wind_speed_match):
+        confidence = "strong"
+    elif batted_balls >= 35 and dimension_count >= 3:
+        confidence = "usable"
+    else:
+        confidence = "limited"
+    available = batted_balls > 0 and dimension_count >= 3
+    if not available:
+        multiplier, total_effect, confidence = 1.0, 0.0, "limited"
+
+    if total_effect >= .045:
+        label, tone = "favorable power environment", "good"
+    elif total_effect <= -.045:
+        label, tone = "suppressive power environment", "bad"
+    else:
+        label, tone = "neutral power environment", "neutral"
+    factors = []
+    if dimension_count:
+        factors.append(f"Directional wall fit {distance_effect:+.1%}")
+    if weather_limited:
+        factors.append("Roof limits weather impact")
+    elif wind_sign and target:
+        factors.append(f"Wind {wind_effect:+.1%} toward {target}")
+    elif wind_text:
+        factors.append("No reliable outfield wind vector")
+    if temperature is not None and not weather_limited:
+        factors.append(f"Temperature carry {temperature_effect:+.1%}")
+    return {
+        "available": available,
+        "label": label,
+        "tone": tone,
+        "multiplier": round(multiplier, 3),
+        "effect": round(total_effect, 3),
+        "park_effect": round(distance_effect, 3),
+        "wind_effect": round(wind_effect, 3),
+        "temperature_effect": round(temperature_effect, 3),
+        "wind_target": target,
+        "wind_speed": wind_speed,
+        "confidence": confidence,
+        "batted_balls": int(batted_balls),
+        "bat_side": spray_profile.get("bat_side"),
+        "pull_rate": _number(spray_profile.get("pull_rate")),
+        "center_rate": _number(spray_profile.get("center_rate")),
+        "opposite_rate": _number(spray_profile.get("opposite_rate")),
+        "sectors": {sector: round(sectors[sector], 4) for sector in FIELD_SECTORS},
+        "factors": factors,
+        "method": "directional park/weather proxy v1",
     }
 
 
@@ -1143,7 +1319,37 @@ def hitter_opportunity_reads(batter, metrics, market_context):
     lineup_number = _number(lineup_order)
     projected_pa = _lineup_weight(lineup_order)
     total = _number(market_context.get("total"))
-    favorite = _number(market_context.get("favorite_adjustment"), 0.0) > 0
+    team_runs = _number(market_context.get("team_run_expectation"))
+    favorite = bool(market_context.get("is_favorite"))
+    starter_quality = metrics.get("starter_quality") or {}
+    starter_adjustment = _number(starter_quality.get("score_adjustment"), 0.0)
+    environment = metrics.get("environment") or {}
+    environment_effect = _number(environment.get("effect"), 0.0) if environment.get("available") else 0.0
+    power_environment_adjustment = clamp(environment_effect / .10 * .20, -.30, .30)
+    home_run_environment_adjustment = clamp(environment_effect / .10 * .45, -.60, .60)
+    platoon = metrics.get("platoon") or {}
+    platoon_ab = max(0.0, _number(platoon.get("at_bats"), 0.0))
+    platoon_reliability = platoon_ab / (platoon_ab + 120.0) if platoon_ab else 0.0
+    raw_platoon_avg = _number(platoon.get("raw_avg"))
+    raw_platoon_slg = _number(platoon.get("raw_slg"))
+    raw_platoon_iso = (
+        max(0.0, raw_platoon_slg - raw_platoon_avg)
+        if raw_platoon_avg is not None and raw_platoon_slg is not None else None
+    )
+    # The pitch model already uses a shrunk handedness prior. These smaller
+    # terms make a stable left/right split explicit without double-counting it.
+    platoon_contact = (
+        .14 * platoon_reliability * clamp((raw_platoon_avg - LEAGUE_HITTER_AVERAGE) / .040, -1.0, 1.0)
+        if raw_platoon_avg is not None else 0.0
+    )
+    platoon_power = (
+        .18 * platoon_reliability * clamp((raw_platoon_slg - LEAGUE_HITTER_SLG) / .100, -1.0, 1.0)
+        if raw_platoon_slg is not None else 0.0
+    )
+    platoon_home_run = (
+        .15 * platoon_reliability * clamp((raw_platoon_iso - LEAGUE_HITTER_ISO) / .080, -1.0, 1.0)
+        if raw_platoon_iso is not None else 0.0
+    )
 
     contact_score = (
         0.72 * (expected_average - LEAGUE_HITTER_AVERAGE) / 0.025
@@ -1159,10 +1365,14 @@ def hitter_opportunity_reads(batter, metrics, market_context):
         + 0.33 * (expected_iso - LEAGUE_HITTER_ISO) / 0.060
         + 0.25 * (barrel_rate - LEAGUE_BARREL_PROXY_RATE) / 0.030
     )
+    contact_score += starter_adjustment + platoon_contact
+    power_score += starter_adjustment + platoon_power + power_environment_adjustment
+    home_run_score += starter_adjustment + platoon_home_run + home_run_environment_adjustment
     lineup_score = clamp((projected_pa - 4.2) / 0.45, -1.0, 1.0)
-    environment_score = clamp(((total - LEAGUE_GAME_TOTAL) / 1.5) if total is not None else 0.0, -1.0, 1.0)
-    if favorite:
-        environment_score = clamp(environment_score + 0.20, -1.0, 1.0)
+    environment_score = clamp(
+        ((team_runs - LEAGUE_TEAM_RUNS) / .75) if team_runs is not None else 0.0,
+        -1.0, 1.0,
+    )
     run_score = 0.30 * contact_score + 0.25 * power_score + 0.30 * lineup_score + 0.15 * environment_score
     offense_scores = sorted((contact_score, power_score, home_run_score), reverse=True)
     overall_score = 0.50 * offense_scores[0] + 0.30 * offense_scores[1] + 0.20 * run_score
@@ -1178,12 +1388,19 @@ def hitter_opportunity_reads(batter, metrics, market_context):
         base_risks.append("Lower-order plate-appearance risk")
     if k_rate >= 0.26:
         base_risks.append(f"Elevated {k_rate:.1%} descriptive K rate")
-    platoon = metrics.get("platoon") or {}
     if metrics.get("platoon_disagreement"):
         base_risks.append(
             f"Pitch-fit estimate disagrees with the {_number(platoon.get('at_bats'), 0):.0f}-AB "
             f"{platoon.get('label', 'platoon')} baseline"
         )
+    if starter_quality.get("available") and _number(starter_quality.get("quality"), 0.0) >= .30:
+        er9 = _number(starter_quality.get("earned_runs_per_nine"))
+        whip = _number(starter_quality.get("whip"))
+        detail = " · ".join(value for value in (
+            f"{er9:.2f} ER/9" if er9 is not None else None,
+            f"{whip:.2f} WHIP" if whip is not None else None,
+        ) if value)
+        base_risks.append(f"Tough starter run prevention{': ' + detail if detail else ''}")
 
     if hitter_strong_evidence(metrics):
         evidence = "strong"
@@ -1204,6 +1421,14 @@ def hitter_opportunity_reads(batter, metrics, market_context):
             tier, tone = "tough", "bad"
         else:
             tier, tone = "neutral", "neutral"
+        # A marginal-data hitter signal should not be called strong against a
+        # demonstrably strong run suppressor. It remains visible as favorable.
+        if (
+            tier == "strong"
+            and _number(starter_quality.get("quality"), 0.0) >= .30
+            and coverage < .50
+        ):
+            tier = "favorable"
         return {
             "key": key,
             "title": title,
@@ -1217,33 +1442,52 @@ def hitter_opportunity_reads(batter, metrics, market_context):
         }
 
     quality_risks = [] if quality_coverage >= 0.20 else ["Limited hard-hit and barrel evidence"]
+    environment_risks = (
+        ["Limited directional park/weather evidence"]
+        if environment.get("confidence") == "limited" else []
+    )
+    platoon_driver = (
+        f"{platoon.get('label', 'Platoon')} {raw_platoon_avg:.3f} AVG / {raw_platoon_slg:.3f} SLG ({platoon_ab:.0f} AB)"
+        if raw_platoon_avg is not None and raw_platoon_slg is not None
+        else f"{platoon.get('label', 'Platoon')} data pending"
+    )
+    starter_driver = (
+        f"Starter quality {starter_quality.get('label')} ({starter_adjustment:+.2f})"
+        if starter_quality.get("available") else "Starter quality pending"
+    )
+    environment_driver = (
+        f"Park/weather power {environment.get('multiplier', 1.0):.2f}× · {environment.get('label', 'neutral')}"
+        if environment.get("available") else "Park/weather directional profile pending"
+    )
     opportunities = {
         "hit": build(
             "hit", "Hit opportunity", contact_score,
             f"{expected_average:.3f} matchup AVG",
             [f"Matchup AVG {expected_average:.3f} vs {LEAGUE_HITTER_AVERAGE:.3f} MLB",
-             f"Descriptive K rate {k_rate:.1%}", f"Arsenal coverage {coverage:.0%}"],
+             platoon_driver, starter_driver],
         ),
         "total_bases": build(
             "total_bases", "Total-base power", power_score,
             f"{expected_slg:.3f} matchup SLG",
             [f"Matchup SLG {expected_slg:.3f} vs {LEAGUE_HITTER_SLG:.3f} MLB",
-             f"Matchup ISO {expected_iso:.3f}", f"Hard-hit read {hard_hit_rate:.1%}"],
-            quality_risks,
+             f"Matchup ISO {expected_iso:.3f}", environment_driver],
+            [*quality_risks, *environment_risks],
         ),
         "home_run": build(
             "home_run", "Home-run power", home_run_score,
             f"{expected_iso:.3f} matchup ISO",
             [f"Matchup ISO {expected_iso:.3f} vs {LEAGUE_HITTER_ISO:.3f} MLB",
-             f"Barrel proxy {barrel_rate:.1%}", f"Pitch-ending HR rate {hr_rate:.1%}"],
-            quality_risks,
+             f"Barrel proxy {barrel_rate:.1%}", environment_driver],
+            [*quality_risks, *environment_risks],
         ),
         "runs_rbi": build(
             "runs_rbi", "Runs + RBI opportunity", run_score,
             f"{projected_pa:.1f} expected PA",
             [f"Batting {lineup_order or 'order pending'} · about {projected_pa:.1f} PA",
-             f"Game total {total:.1f}" if total is not None else "Game total unavailable",
-             "Batting team is favored" if favorite else f"Matchup SLG {expected_slg:.3f}"],
+             (f"Team run expectation {team_runs:.2f} of {total:.1f}" if team_runs is not None and total is not None
+              else "Team run expectation unavailable"),
+             ("Batting team is favored" if favorite else
+              ("Batting team is the underdog" if market_context.get("team_role") == "underdog" else f"Matchup SLG {expected_slg:.3f}"))],
             ["Runs/RBIs also depend on surrounding hitters and bullpen"] if lineup_order else [],
         ),
     }
@@ -1252,7 +1496,8 @@ def hitter_opportunity_reads(batter, metrics, market_context):
     opportunities["overall"] = build(
         "overall", "Overall offensive opportunity", overall_score,
         f"{primary['title']}",
-        [f"Best path: {primary['title']}", *primary["drivers"][:2]],
+        [f"Best path: {primary['title']}", primary["drivers"][0],
+         environment_driver if environment.get("available") else primary["drivers"][1]],
         primary["risks"],
     )
     return {
@@ -1279,7 +1524,7 @@ def hitter_arsenal_summary(batter, pitches, league_average=LEAGUE_HITTER_AVERAGE
         "iso": _number(platoon.get("posterior_iso"), LEAGUE_HITTER_ISO),
     }
     if total_usage <= 0:
-        empty = {"label": "insufficient", "tier": "watchlist", "tone": "neutral", "coverage": 0.0, "effective_sample_size": 0.0, "expected_average": platoon_prior["avg"], "expected_slg": platoon_prior["slg"], "expected_iso": platoon_prior["iso"], "delta": platoon_prior["avg"] - league_average, "base_score": 0.0, "score": market_context["adjustment"], "market_context": market_context, "context_coverage": 0.0, "quality_coverage": 0.0, "hard_hit_rate": LEAGUE_HARD_HIT_RATE, "barrel_rate": LEAGUE_BARREL_PROXY_RATE, "hr_rate": LEAGUE_HITTER_HR_RATE, "platoon": platoon}
+        empty = {"label": "insufficient", "tier": "watchlist", "tone": "neutral", "coverage": 0.0, "effective_sample_size": 0.0, "expected_average": platoon_prior["avg"], "expected_slg": platoon_prior["slg"], "expected_iso": platoon_prior["iso"], "delta": platoon_prior["avg"] - league_average, "base_score": 0.0, "score": market_context["adjustment"], "market_context": market_context, "context_coverage": 0.0, "quality_coverage": 0.0, "hard_hit_rate": LEAGUE_HARD_HIT_RATE, "barrel_rate": LEAGUE_BARREL_PROXY_RATE, "hr_rate": LEAGUE_HITTER_HR_RATE, "platoon": platoon, "environment": batter.get("environment") or {}}
         empty["opportunities"] = hitter_opportunity_reads(batter, empty, market_context)
         empty["risk"] = empty["opportunities"]["risk"]
         return empty
@@ -1355,6 +1600,7 @@ def hitter_arsenal_summary(batter, pitches, league_average=LEAGUE_HITTER_AVERAGE
         "platoon": platoon,
         "platoon_disagreement": platoon_disagreement,
         "strong_evidence": strong_evidence,
+        "environment": batter.get("environment") or {},
     }
     result["opportunities"] = hitter_opportunity_reads(batter, result, market_context)
     result["risk"] = result["opportunities"]["risk"]
@@ -1364,7 +1610,8 @@ def hitter_arsenal_summary(batter, pitches, league_average=LEAGUE_HITTER_AVERAGE
 def blend_full_game_hitter_matchup(batter, starter_summary, bullpen_entries,
                                    expected_batters_faced,
                                    batters_faced_interval=None,
-                                   market_context=None):
+                                   market_context=None,
+                                   starter_performance=None):
     """Blend starter and appearance-weighted reliever evidence by expected PA.
 
     ``bullpen_entries`` contains ``weight`` plus an optional reliever ``summary``.
@@ -1403,6 +1650,9 @@ def blend_full_game_hitter_matchup(batter, starter_summary, bullpen_entries,
     bullpen = dict(metric_defaults)
     starter_k_rate = hitter_k_risk(batter.get("k_profile"))["posterior"]
     bullpen_k_rate = LEAGUE_K_RATE
+    starter_environment = starter.get("environment") or {}
+    bullpen_environment_effect = 0.0
+    bullpen_environment_sample = 0.0
     modeled_weight = 0.0
     mix = []
     if raw_total > 0:
@@ -1413,6 +1663,10 @@ def blend_full_game_hitter_matchup(batter, starter_summary, bullpen_entries,
                 modeled_weight += normalized
             reliever_k = hitter_k_risk(entry.get("k_profile"))["posterior"] if entry.get("k_profile") else LEAGUE_K_RATE
             bullpen_k_rate += normalized * (reliever_k - LEAGUE_K_RATE)
+            reliever_environment = summary.get("environment") or {}
+            if reliever_environment.get("available"):
+                bullpen_environment_effect += normalized * _number(reliever_environment.get("effect"), 0.0)
+                bullpen_environment_sample += normalized * _number(reliever_environment.get("batted_balls"), 0.0)
             for metric, default in metric_defaults.items():
                 value = _number(summary.get(metric), default)
                 bullpen[metric] += normalized * (value - default)
@@ -1446,6 +1700,25 @@ def blend_full_game_hitter_matchup(batter, starter_summary, bullpen_entries,
     result["market_context"] = market_context
     result["platoon"] = starter.get("platoon") or batter.get("platoon") or {}
     result["platoon_disagreement"] = bool(starter.get("platoon_disagreement"))
+    starter_environment_effect = _number(starter_environment.get("effect"), 0.0) if starter_environment.get("available") else 0.0
+    blended_environment_effect = starter_share * starter_environment_effect + bullpen_share * bullpen_environment_effect
+    if blended_environment_effect >= .045:
+        environment_label, environment_tone = "favorable power environment", "good"
+    elif blended_environment_effect <= -.045:
+        environment_label, environment_tone = "suppressive power environment", "bad"
+    else:
+        environment_label, environment_tone = "neutral power environment", "neutral"
+    result["environment"] = {
+        **starter_environment,
+        "available": bool(starter_environment.get("available")) or bullpen_environment_sample > 0,
+        "effect": round(blended_environment_effect, 3),
+        "multiplier": round(1.0 + blended_environment_effect, 3),
+        "label": environment_label,
+        "tone": environment_tone,
+        "batted_balls": int(_number(starter_environment.get("batted_balls"), 0.0) + bullpen_environment_sample),
+        "method": "starter/bullpen directional park-weather blend v1",
+    }
+    result["starter_quality"] = hitter_starter_quality_context(starter_performance, starter_share)
     result["strong_evidence"] = hitter_strong_evidence(result)
     if result["coverage"] < HITTER_ARSENAL_MIN_COVERAGE or result["effective_sample_size"] < HITTER_ARSENAL_MIN_EFFECTIVE_PA:
         result.update({"label": "insufficient", "tier": "watchlist", "tone": "neutral"})
@@ -1490,6 +1763,16 @@ def blend_full_game_hitter_matchup(batter, starter_summary, bullpen_entries,
         opportunity["drivers"] = list(dict.fromkeys(drivers))[:3]
         opportunity["risks"] = list(dict.fromkeys(risks))[:3]
     result["opportunities"] = opportunities
+    overall_tier = opportunities["items"]["overall"]["tier"]
+    result["tier"] = overall_tier
+    result["tone"] = opportunities["items"]["overall"]["tone"]
+    result["label"] = {
+        "strong": "strong full-game research",
+        "favorable": "favorable full-game research",
+        "tough": "tough full-game research",
+        "neutral": "neutral full-game research",
+        "watchlist": "insufficient",
+    }.get(overall_tier, "neutral full-game research")
     result["exposure"] = {
         "projected_pa": round(projected_pa, 2),
         "starter_pa": round(starter_pa, 2),

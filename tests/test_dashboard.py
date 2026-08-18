@@ -28,7 +28,7 @@ class DashboardSpotlightTests(unittest.TestCase):
         self.assertIn("const upcomingProfiles=slateProfiles.filter(({game})=>spotlightEligibleGame(game))", self.page)
         self.assertIn("const pitchers=upcomingProfiles.flatMap", self.page)
         self.assertIn("const batters=upcomingProfiles.flatMap", self.page)
-        self.assertIn("No unstarted games have saved pitcher profiles", self.page)
+        self.assertIn("No qualified pitcher spots yet", self.page)
 
     def test_page_does_not_horizontally_overscroll_outside_tables(self):
         self.assertIn("html,body{max-width:100%;overflow-x:hidden;overscroll-behavior-x:none}", self.page)
@@ -84,9 +84,16 @@ class DashboardSpotlightTests(unittest.TestCase):
         self.assertIn("item.risk.level!=='high'", self.page)
         self.assertNotIn("false positive", self.page.lower())
 
-    def test_spotlight_fills_open_slots_with_watchlist_batters(self):
+    def test_compact_slate_hides_watchlists_until_requested(self):
+        self.assertIn('id="watchlistToggle"', self.page)
+        self.assertIn('aria-pressed="false"', self.page)
+        self.assertIn("showWatchlist=false", self.page)
         self.assertIn("watchlistBatters=eligibleBatters.filter(item=>!item.qualified)", self.page)
-        self.assertIn("shownBatters=[...qualifiedBatters,...watchlistBatters].slice(0,6)", self.page)
+        self.assertIn("shownBatters=[...qualifiedBatters.slice(0,6),...(showWatchlist?watchlistBatters.slice(0,6):[])]", self.page)
+        self.assertIn("shownPitchers=[...qualifiedPitchers.slice(0,6),...(showWatchlist?pitcherWatchlist.slice(0,6):[])]", self.page)
+        self.assertIn("Limited-evidence hitter watchlist", self.page)
+        self.assertIn("Limited-evidence pitcher watchlist", self.page)
+        self.assertIn("showWatchlist=!showWatchlist;renderSpotlights()", self.page)
 
     def test_overall_tab_keeps_outcome_specific_strong_matchups_visible(self):
         self.assertIn("hitterOutcome==='overall'?Object.values", self.page)
@@ -145,6 +152,14 @@ class DashboardSpotlightTests(unittest.TestCase):
         self.assertIn("${esc(marketRead(game.odds))}", self.page)
         self.assertIn("Game market:", self.page)
         self.assertIn("small context points", self.page)
+
+    def test_directional_park_and_weather_fit_is_visible_and_scoped(self):
+        self.assertIn("function environmentMarkup", self.page)
+        self.assertIn("Park/weather ${Number(environment.multiplier||1).toFixed(2)}×", self.page)
+        self.assertIn("Park geometry", self.page)
+        self.assertIn("context.park?.dimensions", self.page)
+        self.assertIn("modify only total-base and home-run opportunity", self.page)
+        self.assertIn("do not rewrite historical AVG/SLG", self.page)
 
     def test_batter_spotlight_has_outcome_specific_opportunities(self):
         self.assertIn("Best hitter opportunities", self.page)

@@ -11,6 +11,7 @@ from urllib.parse import urlencode
 from urllib.request import urlopen
 import argparse
 import json
+from math import atan2, degrees
 
 from analytics_store import connect, initialize
 from modeling import bullpen_readiness
@@ -152,6 +153,33 @@ def barrel_proxy(pitch):
     except (TypeError, ValueError):
         return False
     return (speed >= 98 and 24 <= angle <= 31) or (speed >= 102 and 18 <= angle <= 36)
+
+
+def spray_sector(pitch):
+    """Map MLB Gameday batted-ball chart coordinates to five field sectors.
+
+    The chart coordinate origin is approximate, so this is intentionally a
+    broad directional bucket rather than a claimed exact spray angle.
+    """
+    coordinates = (pitch.get("hitData") or {}).get("coordinates") or {}
+    try:
+        x = float(coordinates.get("coordX"))
+        y = float(coordinates.get("coordY"))
+    except (TypeError, ValueError):
+        return None
+    forward = 198.27 - y
+    if forward <= 0:
+        return None
+    angle = degrees(atan2(x - 125.42, forward))
+    if angle <= -22.5:
+        return "LF"
+    if angle <= -7.5:
+        return "LCF"
+    if angle < 7.5:
+        return "CF"
+    if angle < 22.5:
+        return "RCF"
+    return "RF"
 
 def umpire_game_line(feed):
     """Aggregate home-plate umpire outcomes from one completed MLB game feed."""
@@ -454,7 +482,7 @@ def save_completed_game_observations(feed, db):
                 ),
             )
 
-def process_feed(feed, pitcher_ids, batter_ids, pitcher_data, pitcher_context_data, batter_events, batter_pitch_events, batter_pitch_zones, batter_velocity_events, batter_context_events, batter_quality, pitcher_workloads, batter_discipline=None):
+def process_feed(feed, pitcher_ids, batter_ids, pitcher_data, pitcher_context_data, batter_events, batter_pitch_events, batter_pitch_zones, batter_velocity_events, batter_context_events, batter_quality, pitcher_workloads, batter_discipline=None, batter_spray=None):
     game_lines = defaultdict(lambda: {"batters_faced": 0, "strikeouts": 0, "outs": 0, "pitches": 0})
     for play in feed.get("liveData", {}).get("plays", {}).get("allPlays", []):
         matchup = play.get("matchup", {})
@@ -533,6 +561,20 @@ def process_feed(feed, pitcher_ids, batter_ids, pitcher_data, pitcher_context_da
                     quality["batted_balls"] += 1
                     quality["hard_hits"] += int(launch_speed >= 95)
                     quality["barrel_proxy"] += int(barrel_proxy(pitch))
+                    sector = spray_sector(pitch)
+                    if batter_spray is not None and sector:
+                        bat_side = str((matchup.get("batSide") or {}).get("code") or "U")
+                        pitcher_throws = str((matchup.get("pitchHand") or {}).get("code") or "U")
+                        spray = batter_spray[batter_id][bat_side][pitcher_throws][pitch_code][sector]
+                        spray["batted_balls"] += 1
+                        spray["hard_hits"] += int(launch_speed >= 95)
+                        spray["barrel_proxy"] += int(barrel_proxy(pitch))
+                        spray["home_runs"] += int(event == "home_run")
+                        spray["exit_velocity_sum"] += launch_speed
+                        try:
+                            spray["launch_angle_sum"] += float(hit.get("launchAngle"))
+                        except (TypeError, ValueError):
+                            pass
             batter_quality[batter_id][code]["strikeouts"] += int(event in STRIKEOUTS)
     official_date = feed.get("gameData", {}).get("datetime", {}).get("officialDate", "")
     for pitcher_id, line in game_lines.items():
@@ -589,10 +631,19 @@ def sync_game(game_pk, season, workers):
     batter_velocity_events = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
     batter_context_events = batter_context_store()
     batter_quality = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
+    batter_spray = defaultdict(
+        lambda: defaultdict(
+            lambda: defaultdict(
+                lambda: defaultdict(
+                    lambda: defaultdict(lambda: defaultdict(float))
+                )
+            )
+        )
+    )
     batter_discipline = defaultdict(batter_discipline_record)
     pitcher_workloads = defaultdict(list)
     for feed in feeds:
-        process_feed(feed, profile_pitcher_ids, batters, pitcher_data, pitcher_context_data, batter_events, batter_pitch_events, batter_pitch_zones, batter_velocity_events, batter_context_events, batter_quality, pitcher_workloads, batter_discipline)
+        process_feed(feed, profile_pitcher_ids, batters, pitcher_data, pitcher_context_data, batter_events, batter_pitch_events, batter_pitch_zones, batter_velocity_events, batter_context_events, batter_quality, pitcher_workloads, batter_discipline, batter_spray)
     # A probable starter can have no 2026 pitch history (injury, rookie, or a
     # future game-date). Use only that pitcher's actual prior-season game logs
     # as a transparent fallback instead of dropping the whole matchup.
@@ -666,6 +717,24 @@ def sync_game(game_pk, season, workers):
             db.execute("DELETE FROM gameday_batter_pitch_quality WHERE season=? AND player_id=?", (season, batter_id))
             for code, quality in batter_quality[batter_id].items():
                 db.execute("INSERT INTO gameday_batter_pitch_quality VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (season, batter_id, code, quality["pitches"], quality["swings"], quality["whiffs"], quality["chase_swings"], quality["batted_balls"], quality["hard_hits"], quality["barrel_proxy"], quality["strikeouts"]))
+            db.execute("DELETE FROM gameday_batter_spray WHERE season=? AND player_id=?", (season, batter_id))
+            for bat_side, hands in batter_spray[batter_id].items():
+                for pitcher_throws, pitch_codes in hands.items():
+                    for code, sectors in pitch_codes.items():
+                        for sector, spray in sectors.items():
+                            db.execute(
+                                """INSERT INTO gameday_batter_spray(
+                                     season, player_id, bat_side, pitcher_throws, pitch_code, sector,
+                                     batted_balls, hard_hits, barrel_proxy, home_runs,
+                                     exit_velocity_sum, launch_angle_sum
+                                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                (
+                                    season, batter_id, bat_side, pitcher_throws, code, sector,
+                                    int(spray["batted_balls"]), int(spray["hard_hits"]),
+                                    int(spray["barrel_proxy"]), int(spray["home_runs"]),
+                                    spray["exit_velocity_sum"], spray["launch_angle_sum"],
+                                ),
+                            )
             discipline = batter_discipline[batter_id]
             db.execute(
                 """INSERT OR REPLACE INTO gameday_batter_discipline(

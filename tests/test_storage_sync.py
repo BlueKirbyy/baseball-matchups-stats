@@ -17,7 +17,7 @@ from collections import defaultdict
 from sync_matchup_data import (
     active_slate_schedule, batter_context_store, batter_discipline_record,
     count_bucket, completed_game_observations, game_log_pks_from_payload,
-    outcome_counts, process_feed,
+    outcome_counts, process_feed, spray_sector,
 )
 
 
@@ -41,8 +41,8 @@ class StorageAndSyncTests(unittest.TestCase):
         initialize(self.db_path)
         with connect(self.db_path) as db:
             self.assertEqual(db.execute("SELECT value FROM legacy").fetchone()[0], "preserve me")
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 10)
-            self.assertEqual(db.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 10)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 11)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 11)
             columns = {row[1] for row in db.execute("PRAGMA table_info(gameday_batter_pitch_velocity)")}
             self.assertTrue({"doubles", "triples", "total_bases"}.issubset(columns))
             context_columns = {row[1] for row in db.execute("PRAGMA table_info(gameday_batter_pitch_context)")}
@@ -57,6 +57,7 @@ class StorageAndSyncTests(unittest.TestCase):
             self.assertTrue(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='settled_player_outcomes'").fetchone())
             self.assertTrue(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='pitcher_game_ml_examples'").fetchone())
             self.assertTrue(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ml_model_registry'").fetchone())
+            self.assertTrue(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='gameday_batter_spray'").fetchone())
 
     def test_bullpen_snapshots_are_append_only_and_read_as_one_unit(self):
         initialize(self.db_path)
@@ -99,7 +100,8 @@ class StorageAndSyncTests(unittest.TestCase):
                 "details": {"type": {"code": "SL", "description": "Slider"}, "description": "In play"},
                 "count": {"balls": 1, "strikes": 1},
                 "pitchData": {"startSpeed": 86.2, "coordinates": {"pX": 0.0, "pZ": 2.6}},
-                "hitData": {"launchSpeed": 101.0, "launchAngle": 20.0},
+                "hitData": {"launchSpeed": 101.0, "launchAngle": 20.0,
+                            "coordinates": {"coordX": 175.0, "coordY": 95.0}},
             }],
         }]}}}
         pitcher_data = defaultdict(lambda: defaultdict(lambda: {"name": "Pitch", "speeds": [], "zones": [0] * 9}))
@@ -112,12 +114,15 @@ class StorageAndSyncTests(unittest.TestCase):
         quality = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
         workloads = defaultdict(list)
         discipline = defaultdict(batter_discipline_record)
+        spray = defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(float))))))
         process_feed(feed, {200}, {100}, pitcher_data, pitcher_context, batter_events, pitch_events,
-                     pitch_zones, velocity_events, context_events, quality, workloads, discipline)
+                     pitch_zones, velocity_events, context_events, quality, workloads, discipline, spray)
         self.assertEqual(context_events[100]["SL"][86]["R"]["even"][4], ["double"])
         self.assertEqual(discipline[100]["plate_appearances"], 1)
         self.assertEqual(discipline[100]["pitches_seen"], 1)
         self.assertEqual(discipline[100]["total_bases"], 2)
+        self.assertEqual(spray[100]["U"]["R"]["SL"]["RF"]["batted_balls"], 1)
+        self.assertEqual(spray_sector(feed["liveData"]["plays"]["allPlays"][0]["playEvents"][0]), "RF")
 
     def test_as_of_game_log_cutoff_keeps_traded_history(self):
         payload = {"stats": [{"splits": [

@@ -5,8 +5,10 @@ import unittest
 from modeling import (
     american_from_probability, blend_full_game_hitter_matchup, bullpen_readiness,
     distribution_summary, expected_starter_plate_appearances, expected_value,
-    hitter_arsenal_summary, hitter_k_risk, hitter_market_context, hitter_pitch_summary, implied_probability, k_data_grade,
-    lineup_k_evidence, no_vig_probabilities, pitch_mix_evidence, pitcher_k_projection, shrunk_rate,
+    hitter_arsenal_summary, hitter_k_risk, hitter_market_context, hitter_pitch_summary,
+    hitter_starter_quality_context, implied_probability, k_data_grade,
+    lineup_k_evidence, no_vig_probabilities, park_weather_fit, pitch_mix_evidence,
+    pitcher_k_projection, shrunk_rate,
 )
 
 
@@ -176,6 +178,125 @@ class ModelingTests(unittest.TestCase):
         adjusted = hitter_arsenal_summary(batter, [{"code": "FF", "usage": 100}], market_context=context)
         self.assertAlmostEqual(adjusted["base_score"], baseline["score"])
         self.assertGreater(adjusted["score"], baseline["score"])
+
+    def test_game_total_is_split_into_favorite_and_underdog_team_runs(self):
+        market = {"total": 9.0, "favorite": {"team": "Cincinnati Reds", "probability": .62}}
+        favorite = hitter_market_context(market, {"name": "Cincinnati Reds"})
+        underdog = hitter_market_context(market, {"name": "St. Louis Cardinals"})
+        self.assertTrue(favorite["is_favorite"])
+        self.assertEqual(underdog["team_role"], "underdog")
+        self.assertGreater(favorite["team_run_expectation"], 4.5)
+        self.assertLess(underdog["team_run_expectation"], 4.5)
+        self.assertAlmostEqual(
+            favorite["team_run_expectation"] + underdog["team_run_expectation"],
+            9.0,
+        )
+
+    def test_starter_run_prevention_tempers_full_game_hitter_opportunity(self):
+        batter = {
+            "lineup_order": 3,
+            "k_profile": {"pa": 250, "strikeouts": 50},
+            "platoon": {
+                "label": "vs RHP", "at_bats": 180, "raw_avg": .270, "raw_slg": .460,
+                "posterior_avg": .260, "posterior_slg": .440, "posterior_iso": .180,
+            },
+            "vs_pitches": {
+                "FF": {"pa": 80, "avg": ".310", "advanced": {"slg": .610, "iso": .300}},
+            },
+        }
+        starter = hitter_arsenal_summary(batter, [{"code": "FF", "usage": 100}])
+        tough = blend_full_game_hitter_matchup(
+            batter, starter, [], 23, [18, 28],
+            starter_performance={"earned_runs_per_nine": 3.0, "whip_history": 1.05},
+        )
+        vulnerable = blend_full_game_hitter_matchup(
+            batter, starter, [], 23, [18, 28],
+            starter_performance={"earned_runs_per_nine": 5.8, "whip_history": 1.55},
+        )
+        self.assertEqual(hitter_starter_quality_context(
+            {"earned_runs_per_nine": 3.0, "whip_history": 1.05}
+        )["tone"], "bad")
+        self.assertLess(
+            tough["opportunities"]["items"]["total_bases"]["score"],
+            vulnerable["opportunities"]["items"]["total_bases"]["score"],
+        )
+        self.assertTrue(any(
+            "starter" in risk.lower()
+            for risk in tough["opportunities"]["items"]["total_bases"]["risks"]
+        ))
+
+    def test_stable_handedness_split_changes_hitter_opportunity(self):
+        common = {
+            "lineup_order": 2,
+            "k_profile": {"pa": 250, "strikeouts": 50},
+            "vs_pitches": {
+                "FF": {"pa": 80, "avg": ".260", "advanced": {"slg": .440, "iso": .180}},
+            },
+        }
+        good = hitter_arsenal_summary({
+            **common,
+            "platoon": {"label": "vs LHP", "at_bats": 200, "raw_avg": .300, "raw_slg": .520,
+                        "posterior_avg": .270, "posterior_slg": .460, "posterior_iso": .190},
+        }, [{"code": "FF", "usage": 100}])
+        bad = hitter_arsenal_summary({
+            **common,
+            "platoon": {"label": "vs LHP", "at_bats": 200, "raw_avg": .205, "raw_slg": .310,
+                        "posterior_avg": .230, "posterior_slg": .360, "posterior_iso": .130},
+        }, [{"code": "FF", "usage": 100}])
+        self.assertGreater(
+            good["opportunities"]["items"]["total_bases"]["score"],
+            bad["opportunities"]["items"]["total_bases"]["score"],
+        )
+        self.assertIn("vs LHP", good["opportunities"]["items"]["hit"]["drivers"][1])
+
+    def test_directional_wind_rewards_matching_spray_profile(self):
+        park = {
+            "roof": "Open",
+            "distances": {"LF": 330, "LCF": 375, "CF": 400, "RCF": 375, "RF": 320},
+        }
+        weather = {"temp": 84, "wind": "12 mph, Out To RF"}
+        right_field = park_weather_fit({
+            "bat_side": "L", "batted_balls": 140,
+            "sectors": {"LF": .08, "LCF": .10, "CF": .17, "RCF": .25, "RF": .40},
+            "pull_rate": .65,
+        }, park, weather)
+        left_field = park_weather_fit({
+            "bat_side": "R", "batted_balls": 140,
+            "sectors": {"LF": .40, "LCF": .25, "CF": .17, "RCF": .10, "RF": .08},
+            "pull_rate": .65,
+        }, park, weather)
+        closed_roof = park_weather_fit({
+            "bat_side": "L", "batted_balls": 140, "sectors": right_field["sectors"],
+        }, {**park, "roof": "Closed"}, weather)
+        self.assertGreater(right_field["multiplier"], left_field["multiplier"])
+        self.assertGreater(right_field["wind_effect"], 0)
+        self.assertEqual(closed_roof["wind_effect"], 0)
+        self.assertEqual(right_field["confidence"], "strong")
+
+    def test_environment_changes_power_reads_but_not_hit_read(self):
+        common = {
+            "lineup_order": 3,
+            "k_profile": {"pa": 240, "strikeouts": 48},
+            "vs_pitches": {
+                "FF": {"pa": 80, "avg": ".270", "advanced": {"slg": .480, "iso": .210}},
+            },
+        }
+        favorable = hitter_arsenal_summary({
+            **common,
+            "environment": {"available": True, "effect": .10, "multiplier": 1.10,
+                            "label": "favorable power environment", "confidence": "strong"},
+        }, [{"code": "FF", "usage": 100}])
+        suppressive = hitter_arsenal_summary({
+            **common,
+            "environment": {"available": True, "effect": -.10, "multiplier": .90,
+                            "label": "suppressive power environment", "confidence": "strong"},
+        }, [{"code": "FF", "usage": 100}])
+        good_items = favorable["opportunities"]["items"]
+        bad_items = suppressive["opportunities"]["items"]
+        self.assertEqual(good_items["hit"]["score"], bad_items["hit"]["score"])
+        self.assertGreater(good_items["total_bases"]["score"], bad_items["total_bases"]["score"])
+        self.assertGreater(good_items["home_run"]["score"], bad_items["home_run"]["score"])
+        self.assertIn("Park/weather power", good_items["home_run"]["drivers"][2])
 
     def test_bullpen_readiness_penalizes_heavy_and_consecutive_use(self):
         fresh = bullpen_readiness(0, 0, 12, 0)

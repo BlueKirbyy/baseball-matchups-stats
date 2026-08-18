@@ -8,7 +8,7 @@ The current pitcher-strikeout model is an unvalidated research baseline. The app
 
 - `sync_matchup_data.py`: downloads and caches MLB Gameday feeds, builds current matchup aggregates, and records immutable player-game observations.
 - `analytics_store.py`: SQLite schema plus numbered, non-destructive migrations.
-- `modeling.py`: empirical-Bayes shrinkage, arsenal coverage, bullpen readiness/exposure, pitcher-K workload, count distributions, and market math.
+- `modeling.py`: empirical-Bayes shrinkage, arsenal coverage, directional park/weather fit, bullpen readiness/exposure, pitcher-K workload, count distributions, and market math.
 - `pitcher_ml.py` / `train_pitcher_ml.py`: chronological starter-game features, workload challengers, dependency-free shadow inference, and the workload-driven K distribution.
 - `prediction_store.py`: append-only pregame, market, prediction, and result records.
 - `market_data.py`: sportsbook/pick'em CSV and manual market import.
@@ -37,7 +37,7 @@ python3 -m unittest discover -s tests -v
 
 ## Database migrations
 
-Starting the server or a CLI calls `analytics_store.initialize()`. Migrations are recorded in `schema_migrations`; the current version is 10. Existing research tables and rows are retained. Database triggers reject updates and deletes on observations, pregame snapshots, ML feature snapshots, settled outcomes, training examples, bullpen snapshots, market snapshots, workload overrides, predictions, and results.
+Starting the server or a CLI calls `analytics_store.initialize()`. Migrations are recorded in `schema_migrations`; the current version is 11. Existing research tables and rows are retained. Database triggers reject updates and deletes on observations, pregame snapshots, ML feature snapshots, settled outcomes, training examples, bullpen snapshots, market snapshots, workload overrides, predictions, and results.
 
 To inspect the database safely:
 
@@ -79,17 +79,28 @@ the added power and count/hand/zone context fields. Until then, the board
 explicitly marks power metrics as pending.
 
 Each game card also displays ESPN's best-effort public total and moneyline
-favorite when available. Hitter ranking includes a clearly shown, capped market
-context adjustment: a higher/lower total can move the fit by at most 3.5 points,
-and a favorite gets a further 1.5-point team-scoring-context adjustment. Pitch,
-power, lineup, and sample evidence remain the primary inputs; missing markets
-produce no adjustment.
+favorite when available. Hitter ranking turns those two inputs into a clearly
+shown, team-specific run expectation: the moneyline favorite receives the
+larger share of the total, while games without a usable favorite are split
+evenly. The resulting market adjustment is capped; pitch, power, lineup, and
+sample evidence remain the primary inputs, and missing markets produce no
+adjustment.
 
 The same sync also creates a timestamped bullpen snapshot for each team. It
 identifies active relief candidates, estimates readiness from pitches thrown
 today and over the prior two days, infers a broad short/long-relief role, and
 builds pitch profiles from the same strictly pregame Gameday history. These are
 workload estimates—not official availability or manager intent.
+
+The sync also saves each hitter's five-sector spray distribution (LF, LCF, CF,
+RCF, RF) by batting side, pitcher hand, and pitch type. The matchup model blends
+that spray profile with the probable pitch mix, venue wall distances, roof
+status, temperature, and directional wind. This is a conservative carry and
+geometry adjustment used only for **total-base** and **home-run** opportunity;
+it does not rewrite historical AVG/SLG or alter hit and strikeout reads. The UI
+shows the multiplier, direction, batter side, sample size, and confidence so
+the adjustment is auditable. Run `python3 sync_statcast.py --all` once after
+upgrading to backfill the new spray table; normal future syncs keep it current.
 
 For an old game, the target game itself and later dates are excluded. Cached feeds are raw source responses; prediction features still apply the as-of cutoff.
 

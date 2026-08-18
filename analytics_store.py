@@ -513,6 +513,25 @@ MIGRATIONS = (
     CREATE TRIGGER IF NOT EXISTS immutable_ml_model_registry_update BEFORE UPDATE ON ml_model_registry BEGIN SELECT RAISE(ABORT, 'ml_model_registry is immutable'); END;
     CREATE TRIGGER IF NOT EXISTS immutable_ml_model_registry_delete BEFORE DELETE ON ml_model_registry BEGIN SELECT RAISE(ABORT, 'ml_model_registry is immutable'); END;
     """),
+    (11, """
+    CREATE TABLE IF NOT EXISTS gameday_batter_spray (
+      season INTEGER NOT NULL,
+      player_id INTEGER NOT NULL,
+      bat_side TEXT NOT NULL,
+      pitcher_throws TEXT NOT NULL,
+      pitch_code TEXT NOT NULL,
+      sector TEXT NOT NULL,
+      batted_balls INTEGER NOT NULL,
+      hard_hits INTEGER NOT NULL,
+      barrel_proxy INTEGER NOT NULL,
+      home_runs INTEGER NOT NULL,
+      exit_velocity_sum REAL NOT NULL,
+      launch_angle_sum REAL NOT NULL,
+      PRIMARY KEY (season, player_id, bat_side, pitcher_throws, pitch_code, sector)
+    );
+    CREATE INDEX IF NOT EXISTS idx_batter_spray_lookup
+      ON gameday_batter_spray(season, player_id, bat_side, pitcher_throws, pitch_code);
+    """),
 )
 
 def connect(db_path=None):
