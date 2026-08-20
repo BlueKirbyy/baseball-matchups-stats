@@ -18,8 +18,6 @@ The current pitcher-strikeout model is an unvalidated research baseline. The app
 - `index.html`: responsive daily prop board and detailed pitch research. It displays server-computed statistics; model formulas no longer live in browser JavaScript.
 - `diamond_intel.db`: the existing local database. Initialization migrates it in place and does not delete existing tables.
 
-The unused PrizePicks Node proxy was removed. Market providers now enter through the explicit adapter/import boundary rather than an undocumented upstream endpoint.
-
 ## Setup and start
 
 Python 3.9 or newer is sufficient; runtime code uses the standard library.
@@ -127,26 +125,7 @@ The import format is demonstrated in `examples/markets.csv`. Required columns ar
 - `prop_type`
 - `line`
 
-Recommended identifiers are `game_pk` and `player_id`. Sportsbook rows should contain both `over_price` and `under_price`. Pick'em payout structure belongs in `payout_json`; it is never converted into fictional single-leg odds.
-
-```bash
-python3 market_data.py import examples/markets.csv
-```
-
-Manual sportsbook example:
-
-```bash
-python3 market_data.py add \
-  --captured-at 2026-08-12T18:00:00-04:00 \
-  --provider "Example Book" \
-  --platform-type sportsbook \
-  --game-pk 823994 \
-  --player-id 123456 \
-  --player-name "Example Pitcher" \
-  --line 5.5 \
-  --over-price -110 \
-  --under-price -110
-```
+Recommended identifiers are `game_pk` and `player_id`.
 
 Every import is a new immutable snapshot. Use `--closing` only for the final pregame observation you intend to treat as the closing price.
 
@@ -273,7 +252,6 @@ An empty report is expected until immutable predictions are saved and settled. H
 
 - MLB Stats API/Gameday supplies schedules, probable pitchers, lineups, pitch type, velocity, coarse coordinates, handedness, and outcomes. It is a public web service without an application uptime guarantee.
 - ESPN’s public scoreboard provides best-effort game totals and moneylines, not player props.
-- Prop markets must be imported or entered manually unless a new provider adapter is implemented.
 - The final pitch of a plate appearance is used to group the PA outcome by pitch type. This is descriptive attribution, not proof that the pitch caused the outcome.
 - Pitch-cell SLG, ISO, and XBH are descriptive final-pitch outcomes, not hit or total-base prop probabilities.
 - The displayed barrel value is explicitly a conservative proxy, not MLB’s official Barrel metric. No xwOBA is fabricated.
@@ -285,4 +263,4 @@ An empty report is expected until immutable predictions are saved and settled. H
 
 Normalize a provider response to the `market_snapshots` fields and call `add_market_snapshot`; keep network/authentication details outside model code. A new prop needs a versioned server-side target model, immutable prediction schema compatibility, settlement mapping, walk-forward evaluation, tests, UI labeling, and a model-card update before any action label is enabled.
 
-Use this tool as research support, shop prices independently, and size risk conservatively. Short historical success does not prove a durable betting advantage.
+Use this tool as research support.
