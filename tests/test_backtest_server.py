@@ -4,7 +4,7 @@ import tempfile
 from datetime import datetime, timedelta, timezone
 
 from analytics_store import connect, initialize
-from backtest import calibration_rows, chronological_splits, evaluate
+from backtest import calibration_rows, chronological_splits, evaluate, evaluate_hitter_recent_form
 from server import (
     Handler, active_slate_date_and_scoreboard, confirmed_starting_lineup,
     hitter_context_metrics, hitter_power_metrics, hitter_spray_profile,
@@ -54,16 +54,33 @@ class BacktestAndServerTests(unittest.TestCase):
         rows = [
             {"projection": 6, "actual_value": 7, "line": 5.5, "probability_over": .7,
              "expected_value_over": .1, "over_price": -110, "confidence": "low", "month": "2026-04",
-             "lineup_status": "confirmed", "pitcher_throws": "R"},
+             "lineup_status": "confirmed", "pitcher_throws": "R", "model_version": "v5"},
             {"projection": 5, "actual_value": 4, "line": 5.5, "probability_over": .3,
              "expected_value_over": None, "over_price": -110, "confidence": "low", "month": "2026-04",
-             "lineup_status": "confirmed", "pitcher_throws": "L"},
+             "lineup_status": "confirmed", "pitcher_throws": "L", "model_version": "v5"},
         ]
         report = evaluate(rows)
         self.assertEqual(report["count"], 2)
         self.assertAlmostEqual(report["mae"], 1)
         self.assertIsNotNone(report["brier"])
         self.assertEqual(sum(bucket["count"] for bucket in report["calibration"]), 2)
+        self.assertEqual(report["groups"]["model_version"]["v5"]["count"], 2)
+        self.assertEqual(report["groups"]["projection_band"]["5.0-5.9"]["count"], 1)
+
+    def test_recent_form_backtest_compares_frozen_with_and_without_scores(self):
+        rows = [
+            {"outcome": "hit", "actual": 1, "score": .70, "recent_form_adjustment": .05,
+             "recent_form_score": .25, "confidence": "medium", "coverage_band": "35-49%",
+             "recent_form_pa_band": "35+", "window_days": 14},
+            {"outcome": "hit", "actual": 0, "score": -.10, "recent_form_adjustment": -.04,
+             "recent_form_score": -.20, "confidence": "limited", "coverage_band": "25-34%",
+             "recent_form_pa_band": "20-34", "window_days": 21},
+        ]
+        report = evaluate_hitter_recent_form(rows)
+        self.assertEqual(report["count"], 2)
+        self.assertIn("brier_with_form", report)
+        self.assertEqual(set(report["by_window_days"]), {"14", "21"})
+        self.assertEqual(report["cap_review"]["current_cap"], .10)
 
     def test_confirmed_lineup_requires_nine_unique_players(self):
         feed = {"liveData": {"boxscore": {"teams": {"away": {

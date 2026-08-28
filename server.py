@@ -12,7 +12,8 @@ from hitter_ml import shadow_prediction
 from park_factors import venue_factor
 from modeling import (
     HITTER_PLATOON_PRIOR_PA, LEAGUE_HITTER_AVERAGE, LEAGUE_HITTER_SLG,
-    blend_full_game_hitter_matchup, hitter_arsenal_summary, hitter_k_risk,
+    blend_full_game_hitter_matchup, calculate_hitter_recent_form,
+    hitter_arsenal_summary, hitter_k_risk,
     hitter_market_context, hitter_pitch_summary, park_weather_fit,
     pitcher_k_projection, shrunk_rate,
 )
@@ -674,6 +675,23 @@ def hitter_platoon_profile(db, season, batter_id, pitcher_throws):
     }
 
 
+def hitter_recent_form_profile(db, batter_id, scheduled_start, official_date):
+    """Load only completed games scheduled before this matchup's first pitch."""
+    as_of = scheduled_start or (f"{official_date}T23:59:59+00:00" if official_date else None)
+    if not as_of:
+        return calculate_hitter_recent_form([], None)
+    rows = [dict(row) for row in db.execute(
+        """SELECT game_pk, scheduled_start, game_date, plate_appearances,
+                  at_bats, hits, walks, hit_by_pitch, sacrifice_flies,
+                  total_bases, doubles, triples, home_runs, strikeouts
+             FROM batter_game_form
+            WHERE player_id=? AND game_date<=?
+            ORDER BY COALESCE(scheduled_start, game_date), game_pk""",
+        (batter_id, official_date or str(as_of)[:10]),
+    )]
+    return calculate_hitter_recent_form(rows, as_of)
+
+
 def hitter_profile_for_pitcher(db, season, batter, pitcher_id, arsenal,
                                pitcher_throws, market_context, game_environment=None):
     """Build the same pitch/velocity/context hitter evidence for any pitcher."""
@@ -825,6 +843,7 @@ def hitter_profile_for_pitcher(db, season, batter, pitcher_id, arsenal,
         "discipline": dict(discipline_row) if discipline_row else {},
         "vs_pitches": by_pitch,
         "platoon": platoon,
+        "recent_form": batter.get("recent_form") or {},
         "k_profile": hitter_k_profile_for_hand(db, season, batter_id, pitcher_throws),
     }
     spray = hitter_spray_profile(
@@ -886,14 +905,20 @@ def matchup_research(game_pk):
             appearance_history = pitcher_appearance_history(db, pitcher["id"], official_date)
             pitcher_throws = next((row.get("throws") for row in reversed(appearance_history) if row.get("throws")), None)
             market_context = hitter_market_context(game_market, batting_team)
+            prepared_hitters = [
+                {**batter, "recent_form": hitter_recent_form_profile(
+                    db, batter["id"], scheduled_start, official_date,
+                )}
+                for batter in hitters
+            ]
             hitter_rows = [
                 hitter_profile_for_pitcher(
                     db, season, batter, pitcher["id"], arsenal,
                     pitcher_throws, market_context, context,
                 )
-                for batter in hitters
+                for batter in prepared_hitters
             ]
-            batter_ids = [batter["id"] for batter in hitters]
+            batter_ids = [batter["id"] for batter in prepared_hitters]
             placeholders = ",".join("?" for _ in batter_ids)
             opponent_row = db.execute(f"SELECT SUM(pa) AS pa, SUM(strikeouts) AS strikeouts FROM gameday_batter_pitch_velocity WHERE season=? AND player_id IN ({placeholders})", (season, *batter_ids)).fetchone() if batter_ids else None
             opponent_k_rate = (opponent_row["strikeouts"] / opponent_row["pa"]) if opponent_row and opponent_row["pa"] and opponent_row["strikeouts"] is not None else None
@@ -941,7 +966,7 @@ def matchup_research(game_pk):
                 reliever_hand = snapshot.get("throws")
                 fits = {}
                 if reliever_arsenal:
-                    for batter in hitters:
+                    for batter in prepared_hitters:
                         reliever_hitter = hitter_profile_for_pitcher(
                             db, season, batter, reliever_id, reliever_arsenal,
                             reliever_hand, market_context, context,
@@ -989,6 +1014,16 @@ def matchup_research(game_pk):
                         "available": False, "status": "unavailable",
                         "message": f"Hitter challenger unavailable: {error}",
                     }
+                hitter["recent_form_snapshot_id"] = record_ml_feature_snapshot(
+                    game_pk, captured_at, scheduled_start, hitter["id"], hitter["name"],
+                    "hitter_spotlight", "hitter-spotlight-recent-form-v1",
+                    "hitter-recent-form-pregame-v1",
+                    {
+                        "recent_form": hitter.get("recent_form") or {},
+                        "opportunities": (hitter.get("full_game_research") or {}).get("opportunities") or {},
+                    },
+                    lineup_confirmed=lineup_confirmed,
+                )
             public_relievers = []
             for reliever in relievers:
                 hitter_fits = []

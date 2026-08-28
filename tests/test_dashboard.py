@@ -61,7 +61,8 @@ class DashboardSpotlightTests(unittest.TestCase):
     def test_spotlights_show_evidence_not_arbitrary_scores(self):
         self.assertIn("lineup_k_evidence?.coverage", self.page)
         self.assertIn("data_grade?.grade", self.page)
-        self.assertIn("effective_sample_size)>=10", self.page)
+        self.assertIn("opportunity.requirements", self.page)
+        self.assertIn("effective_pa", self.page)
         self.assertIn("Expected to face ${Number(p.expected_batters_faced||0).toFixed(1)} hitters", self.page)
         self.assertNotIn("fitRating", self.page)
         self.assertNotIn("91+", self.page)
@@ -88,10 +89,12 @@ class DashboardSpotlightTests(unittest.TestCase):
         self.assertIn('id="watchlistToggle"', self.page)
         self.assertIn('aria-pressed="false"', self.page)
         self.assertIn("showWatchlist=false", self.page)
-        self.assertIn("watchlistBatters=eligibleBatters.filter(item=>!item.qualified)", self.page)
-        self.assertIn("shownBatters=[...qualifiedBatters.slice(0,6),...(showWatchlist?watchlistBatters.slice(0,6):[])]", self.page)
+        self.assertIn("promisingBatters=batters.filter(item=>item.promising)", self.page)
+        self.assertIn("primaryPromising=promisingBatters.slice(0,Math.max(0,6-primaryQualified.length))", self.page)
+        self.assertIn("watchlistBatters=eligibleBatters.filter", self.page)
         self.assertIn("shownPitchers=[...qualifiedPitchers.slice(0,6),...(showWatchlist?pitcherWatchlist.slice(0,6):[])]", self.page)
-        self.assertIn("Limited-evidence hitter watchlist", self.page)
+        self.assertIn("Promising — positive direction, evidence still developing", self.page)
+        self.assertIn("Research watchlist", self.page)
         self.assertIn("Limited-evidence pitcher watchlist", self.page)
         self.assertIn("showWatchlist=!showWatchlist;renderSpotlights()", self.page)
 
@@ -166,20 +169,31 @@ class DashboardSpotlightTests(unittest.TestCase):
         self.assertIn("Best hitter opportunities", self.page)
         for outcome in ("overall", "hit", "total_bases", "home_run", "runs_rbi"):
             self.assertIn(f'data-hitter-outcome="{outcome}"', self.page)
-        self.assertIn("['strong','favorable'].includes(opportunity.tier)", self.page)
-        self.assertIn("['usable','strong'].includes(opportunity.evidence)", self.page)
+        self.assertIn("['strong','favorable'].includes(direction)", self.page)
+        self.assertIn("opportunity.qualified===true", self.page)
+        self.assertIn("opportunity.promising===true", self.page)
         self.assertIn("opportunity.drivers", self.page)
         self.assertIn("Risk:", self.page)
+        self.assertIn("Why not stronger:", self.page)
         self.assertIn("not calibrated prop probabilities", self.page)
 
     def test_batter_spotlight_lists_every_strong_matchup_for_selected_outcome(self):
         self.assertIn('id="allStrongBatterRows"', self.page)
         self.assertIn('id="allStrongBatterTitle"', self.page)
         self.assertIn("const strongBatters=batters.flatMap", self.page)
-        self.assertIn("opportunity?.tier==='strong'&&opportunity?.evidence==='strong'", self.page)
+        self.assertIn("opportunity?.confidence==='high'&&opportunity?.qualified===true", self.page)
         self.assertIn("strongBatters.map", self.page)
         self.assertNotIn("strongBatters.slice", self.page)
         self.assertIn("No upcoming confirmed-lineup batters have a strong matchup for this outcome yet.", self.page)
+
+    def test_recent_form_and_spotlight_diagnostics_are_explained(self):
+        self.assertIn('id="batterSpotlightDiagnostics"', self.page)
+        self.assertIn("function recentFormMarkup", self.page)
+        self.assertIn("small, volatile supporting signal", self.page)
+        self.assertIn("Recent form pending — not used as an exclusion", self.page)
+        self.assertIn("function modelComponentsMarkup", self.page)
+        self.assertIn("Lime: qualified positive matchup", self.page)
+        self.assertIn("Blue: promising, lower confidence", self.page)
 
     def test_bullpen_readiness_and_full_game_hitter_blend_are_visible(self):
         self.assertIn("Estimated bullpen readiness", self.page)

@@ -4,16 +4,114 @@ import unittest
 
 from modeling import (
     american_from_probability, blend_full_game_hitter_matchup, bullpen_readiness,
+    calculate_hitter_recent_form,
     distribution_summary, expected_starter_plate_appearances, expected_value,
     hitter_arsenal_summary, hitter_k_risk, hitter_market_context, hitter_pitch_summary,
     hitter_starter_quality_context, implied_probability, k_data_grade,
     lineup_k_evidence, no_vig_probabilities, park_weather_fit, pitch_mix_evidence,
-    pitcher_k_projection, shrunk_rate,
+    pitcher_k_market_assessment, pitcher_k_projection, shrunk_rate,
+    hitter_recent_form_adjustment,
 )
 from park_factors import PARK_FACTORS, venue_factor
 
 
 class ModelingTests(unittest.TestCase):
+    @staticmethod
+    def recent_form_row(game_pk, start, pa=4, ab=4, hits=2, total_bases=4,
+                        walks=0, home_runs=0, strikeouts=1):
+        return {
+            "game_pk": game_pk, "game_date": start[:10], "scheduled_start": start,
+            "plate_appearances": pa, "at_bats": ab, "hits": hits,
+            "walks": walks, "hit_by_pitch": 0, "sacrifice_flies": 0,
+            "total_bases": total_bases, "doubles": int(total_bases > hits),
+            "triples": 0, "home_runs": home_runs, "strikeouts": strikeouts,
+        }
+
+    @staticmethod
+    def stable_power_batter(pa=120):
+        return {
+            "lineup_order": 3, "season": {"pa": 300},
+            "platoon": {
+                "label": "vs RHP", "at_bats": 120, "raw_avg": .270,
+                "raw_slg": .480, "posterior_avg": .260,
+                "posterior_slg": .440, "posterior_iso": .180,
+            },
+            "k_profile": {"pa": 200, "strikeouts": 35},
+            "vs_pitches": {"FF": {
+                "pa": pa, "avg": ".340", "advanced": {"slg": .700, "iso": .360},
+                "quality": {"batted_balls": 60, "hard_hits": 36, "barrel_proxy": 12},
+                "context": {"coverage": .12},
+            }},
+        }
+
+    def test_recent_form_uses_prior_dates_only_and_excludes_same_day(self):
+        rows = [
+            self.recent_form_row(1, "2026-08-08T19:00:00Z", hits=2),
+            self.recent_form_row(2, "2026-08-22T17:00:00Z", hits=4),
+            self.recent_form_row(3, "2026-08-23T13:00:00Z", hits=4),
+            self.recent_form_row(4, "2026-08-24T19:00:00Z", hits=4),
+        ]
+        form = calculate_hitter_recent_form(rows, "2026-08-23T20:00:00Z")
+        self.assertEqual(form["source_game_pks"], [1, 2])
+        self.assertNotIn(3, form["source_game_pks"])
+        self.assertNotIn(4, form["source_game_pks"])
+        self.assertTrue(all(game["game_date"] < "2026-08-23" for game in form["source_games"]))
+
+    def test_recent_form_is_zero_below_twenty_pa_and_capped(self):
+        rows = [self.recent_form_row(index, f"2026-08-{10 + index:02d}T19:00:00Z") for index in range(1, 5)]
+        form = calculate_hitter_recent_form(rows, "2026-08-23T20:00:00Z")
+        self.assertLess(form["pa"], 20)
+        self.assertEqual(form["score"], 0)
+        self.assertEqual(hitter_recent_form_adjustment("total_bases", form), 0)
+        self.assertLessEqual(abs(hitter_recent_form_adjustment(
+            "total_bases", {"pa": 60, "score": 1, "component_scores": {"total_bases": 99}},
+        )), .10)
+
+    def test_positive_direction_survives_weaker_confidence_as_promising(self):
+        result = hitter_arsenal_summary(
+            self.stable_power_batter(),
+            [{"code": "FF", "usage": 40}, {"code": "SL", "usage": 60}],
+        )
+        opportunity = result["opportunities"]["items"]["total_bases"]
+        self.assertEqual(opportunity["direction"], "favorable")
+        self.assertEqual(opportunity["confidence"], "medium")
+        self.assertFalse(opportunity["qualified"])
+        self.assertTrue(opportunity["promising"])
+
+    def test_positive_direction_remains_favorable_when_confidence_is_limited(self):
+        result = hitter_arsenal_summary(
+            self.stable_power_batter(),
+            [{"code": "FF", "usage": 30}, {"code": "SL", "usage": 70}],
+        )
+        opportunity = result["opportunities"]["items"]["total_bases"]
+        self.assertEqual(opportunity["direction"], "favorable")
+        self.assertEqual(opportunity["confidence"], "limited")
+        self.assertFalse(opportunity["qualified"])
+        self.assertFalse(opportunity["promising"])
+
+    def test_missing_recent_form_does_not_block_qualification(self):
+        result = hitter_arsenal_summary(
+            self.stable_power_batter(),
+            [{"code": "FF", "usage": 55}, {"code": "SL", "usage": 45}],
+        )
+        opportunity = result["opportunities"]["items"]["total_bases"]
+        self.assertEqual(opportunity["confidence"], "high")
+        self.assertTrue(opportunity["qualified"])
+        self.assertEqual(opportunity["recent_form_adjustment"], 0)
+
+    def test_hot_recent_form_cannot_override_high_risk(self):
+        batter = self.stable_power_batter(pa=8)
+        batter["season"] = {"pa": 45}
+        batter["platoon"]["at_bats"] = 18
+        batter["recent_form"] = {
+            "pa": 50, "score": 1.0,
+            "component_scores": {key: 1.0 for key in ("hit", "total_bases", "home_run", "runs_rbi", "overall")},
+        }
+        result = hitter_arsenal_summary(batter, [{"code": "FF", "usage": 100}])
+        self.assertEqual(result["risk"]["level"], "high")
+        self.assertTrue(all(not item["qualified"] for item in result["opportunities"]["items"].values()))
+        self.assertTrue(all(item["direction"] != "strong" for item in result["opportunities"]["items"].values()))
+
     def test_american_odds_and_no_vig(self):
         self.assertAlmostEqual(implied_probability(-110), 110 / 210)
         self.assertAlmostEqual(implied_probability(150), 0.4)
@@ -426,6 +524,70 @@ class ModelingTests(unittest.TestCase):
         self.assertGreater(result["components"]["lineup_adjustment"], 0)
         self.assertIn(result["workload_read"]["label"], {"stable workload", "recently extended"})
         self.assertIn("opportunity", result)
+
+    def test_k_projection_models_each_hitter_and_asymmetric_workload(self):
+        side = {
+            "pitcher_id": 1, "pitcher": "Power Pitcher", "lineup_confirmed": True,
+            "data_freshness_seconds": 0,
+            "workload": {"appearances": 12, "batters_faced": 276, "strikeouts": 92,
+                         "recent_appearances": 3, "recent_batters_faced": 69,
+                         "recent_strikeouts": 24},
+            "appearance_history": [
+                {"is_start": 1, "batters_faced": 23, "pitches": 94, "outs": 18,
+                 "hits_allowed": 5, "walks_allowed": 2}
+                for _ in range(12)
+            ],
+            "arsenal": [{"code": "FF", "usage": 100, "swings": 500,
+                         "whiffs": 165, "chases": 80}],
+            "batters": [{
+                "id": order, "name": f"Hitter {order}", "lineup_order": order,
+                "k_profile": {"pa": 240, "strikeouts": 72},
+                "vs_pitches": {"FF": {"pa": 80, "strikeouts": 26}},
+            } for order in range(1, 10)],
+        }
+        result = pitcher_k_projection(side)
+        self.assertEqual(len(result["hitter_by_hitter_k"]["rows"]), 9)
+        self.assertEqual({row["key"] for row in result["workload_scenarios"]},
+                         {"short", "normal", "extended"})
+        self.assertAlmostEqual(sum(row["probability"] for row in result["workload_scenarios"]), 1.0)
+        self.assertGreater(result["probability_three_or_fewer"], 0)
+        self.assertLessEqual(result["components"]["extreme_rate_shrinkage"], 0)
+        self.assertLessEqual(abs(result["components"]["process_adjustment"]), .008)
+
+    def test_high_k_line_requires_a_meaningful_cushion(self):
+        side = {
+            "pitcher_id": 1, "pitcher": "Test Pitcher", "lineup_confirmed": True,
+            "data_freshness_seconds": 0,
+            "workload": {"appearances": 10, "batters_faced": 230, "strikeouts": 70,
+                         "recent_appearances": 3, "recent_batters_faced": 69,
+                         "recent_strikeouts": 21},
+            "appearance_history": [
+                {"is_start": 1, "batters_faced": 23, "pitches": 94, "outs": 18,
+                 "hits_allowed": 5, "walks_allowed": 2}
+                for _ in range(10)
+            ],
+            "arsenal": [{"code": "FF", "usage": 100, "swings": 400, "whiffs": 120}],
+            "batters": [{
+                "id": order, "name": f"Hitter {order}", "lineup_order": order,
+                "k_profile": {"pa": 250, "strikeouts": 65},
+                "vs_pitches": {"FF": {"pa": 70, "strikeouts": 18}},
+            } for order in range(1, 10)],
+        }
+        market = {"platform_type": "pickem", "provider": "Manual", "line": 7.0,
+                  "market_snapshot_id": 1}
+        result = pitcher_k_projection(side, market)
+        if result["projection"] - 7.0 < .8:
+            self.assertEqual(result["market_assessment"]["label"], "No clear edge")
+            self.assertFalse(result["spotlight_qualified"])
+
+    def test_high_k_over_guardrail_does_not_block_a_clear_under(self):
+        assessment = pitcher_k_market_assessment(
+            {"line": 7.0}, 5.8,
+            {"probability_over": .28, "probability_under": .72},
+            "A", True, .18, .60,
+        )
+        self.assertEqual(assessment["direction"], "under")
+        self.assertEqual(assessment["label"], "Favorable under research")
 
     def test_matchup_workload_uses_lineup_patience_traffic_and_pitch_cap(self):
         starts = [

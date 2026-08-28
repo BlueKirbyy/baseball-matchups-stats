@@ -16,7 +16,7 @@ from collections import defaultdict
 
 from sync_matchup_data import (
     active_slate_schedule, batter_context_store, batter_discipline_record,
-    count_bucket, completed_game_observations, game_log_pks_from_payload,
+    count_bucket, completed_batter_game_forms, completed_game_observations, game_log_pks_from_payload,
     outcome_counts, process_feed, spray_sector,
 )
 
@@ -41,8 +41,8 @@ class StorageAndSyncTests(unittest.TestCase):
         initialize(self.db_path)
         with connect(self.db_path) as db:
             self.assertEqual(db.execute("SELECT value FROM legacy").fetchone()[0], "preserve me")
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 11)
-            self.assertEqual(db.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 11)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 12)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 12)
             columns = {row[1] for row in db.execute("PRAGMA table_info(gameday_batter_pitch_velocity)")}
             self.assertTrue({"doubles", "triples", "total_bases"}.issubset(columns))
             context_columns = {row[1] for row in db.execute("PRAGMA table_info(gameday_batter_pitch_context)")}
@@ -58,6 +58,33 @@ class StorageAndSyncTests(unittest.TestCase):
             self.assertTrue(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='pitcher_game_ml_examples'").fetchone())
             self.assertTrue(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ml_model_registry'").fetchone())
             self.assertTrue(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='gameday_batter_spray'").fetchone())
+            self.assertTrue(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='batter_game_form'").fetchone())
+
+    def test_official_batter_form_line_contains_obp_and_power_inputs(self):
+        feed = {
+            "gameData": {
+                "game": {"pk": 99},
+                "datetime": {"officialDate": "2026-08-20", "dateTime": "2026-08-20T23:05:00Z"},
+                "teams": {"away": {"id": 1}, "home": {"id": 2}},
+            },
+            "liveData": {"boxscore": {"teams": {"away": {
+                "battingOrder": [42],
+                "players": {"ID42": {
+                    "person": {"id": 42, "fullName": "Test Hitter"},
+                    "stats": {"batting": {
+                        "plateAppearances": 5, "atBats": 4, "hits": 2,
+                        "doubles": 1, "triples": 0, "homeRuns": 1,
+                        "baseOnBalls": 1, "hitByPitch": 0, "sacFlies": 0,
+                        "totalBases": 6, "strikeOuts": 1, "runs": 2, "rbi": 3,
+                    }},
+                }},
+            }, "home": {"battingOrder": [], "players": {}}}}},
+        }
+        rows = completed_batter_game_forms(feed, "2026-08-21T00:00:00Z")
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual((row["walks"], row["total_bases"], row["home_runs"]), (1, 6, 1))
+        self.assertEqual((row["runs"], row["rbi"], row["is_start"]), (2, 3, 1))
 
     def test_bullpen_snapshots_are_append_only_and_read_as_one_unit(self):
         initialize(self.db_path)

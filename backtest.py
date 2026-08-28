@@ -5,7 +5,7 @@ import argparse
 from collections import defaultdict
 from datetime import datetime, timezone
 import json
-from math import log, sqrt
+from math import exp, log, sqrt
 
 from analytics_store import connect, initialize
 from modeling import distribution_summary, no_vig_probabilities
@@ -47,6 +47,83 @@ def maximum_drawdown(profits):
     return drawdown
 
 
+def evaluate_hitter_recent_form(rows):
+    """Compare frozen hitter scores with and without the recent-form feature.
+
+    The opportunity model is descriptive rather than calibrated.  The Brier
+    values below therefore compare two versions of the same monotonic score
+    transform; they are promotion evidence, not betting-probability claims.
+    """
+    outcome_key = {
+        "hit": "one_plus_hit", "total_bases": "one_plus_total_base",
+        "home_run": "home_run", "runs_rbi": "run_or_rbi",
+        "overall": "one_plus_hit",
+    }
+    observations = []
+    for raw in rows:
+        row = dict(raw)
+        outcome = row.get("outcome")
+        actual = row.get("actual")
+        if outcome not in outcome_key or actual is None:
+            continue
+        with_score = float(row.get("score") or 0.0)
+        recent = float(row.get("recent_form_adjustment") or 0.0)
+        without_score = with_score - recent
+        # Center the research score on the favorable threshold. This is only a
+        # common comparison transform and is deliberately not shown as a prop
+        # probability in the product.
+        probability_with = 1.0 / (1.0 + exp(-(with_score - .25)))
+        probability_without = 1.0 / (1.0 + exp(-(without_score - .25)))
+        observations.append({
+            **row, "actual": float(actual),
+            "probability_with": probability_with,
+            "probability_without": probability_without,
+        })
+    if not observations:
+        return {
+            "status": "collecting", "count": 0,
+            "note": "Pregame hitter snapshots and settled hitter games are still accumulating.",
+        }
+
+    def summarize(items):
+        if not items:
+            return {"count": 0, "brier_with_form": None, "brier_without_form": None, "brier_delta": None}
+        with_brier = sum((item["probability_with"] - item["actual"]) ** 2 for item in items) / len(items)
+        without_brier = sum((item["probability_without"] - item["actual"]) ** 2 for item in items) / len(items)
+        return {
+            "count": len(items), "brier_with_form": with_brier,
+            "brier_without_form": without_brier,
+            "brier_delta": with_brier - without_brier,
+            "recent_form_helped": with_brier < without_brier,
+        }
+
+    def grouped(key):
+        groups = defaultdict(list)
+        for item in observations:
+            groups[str(item.get(key) or "unknown")].append(item)
+        return {name: summarize(items) for name, items in sorted(groups.items())}
+
+    report = summarize(observations)
+    report.update({
+        "status": "ok",
+        "by_outcome": grouped("outcome"),
+        "by_confidence": grouped("confidence"),
+        "by_coverage_band": grouped("coverage_band"),
+        "by_recent_form_pa_band": grouped("recent_form_pa_band"),
+        "by_window_days": grouped("window_days"),
+        "outside_extreme_hot_streaks": summarize([
+            item for item in observations if abs(float(item.get("recent_form_score") or 0.0)) < .35
+        ]),
+        "cap_review": {
+            "observed_max_adjustment": max(abs(float(item.get("recent_form_adjustment") or 0.0)) for item in observations),
+            "current_cap": .10,
+            "note": "Reduce the cap only after enough walk-forward rows show worse out-of-sample Brier score with form.",
+        },
+        "validation": "chronological frozen pregame snapshots only; descriptive score comparison, not calibrated wagering probabilities",
+    })
+    return report
+
+
 def evaluate(rows):
     settled = []
     for raw in rows:
@@ -57,6 +134,12 @@ def evaluate(rows):
         projection = float(row["projection"])
         actual = float(actual)
         row["error"] = projection - actual
+        row["projection_band"] = (
+            "under 4" if projection < 4.0 else
+            "4.0-4.9" if projection < 5.0 else
+            "5.0-5.9" if projection < 6.0 else
+            "6.0-6.9" if projection < 7.0 else "7.0+"
+        )
         if row.get("line") is not None:
             line = float(row["line"])
             row["over_outcome"] = 1 if actual > line else 0 if actual < line else None
@@ -84,7 +167,10 @@ def evaluate(rows):
         bets.append(row)
         profits.append(profit)
     grouped = {}
-    for dimension in ("confidence", "season", "month", "lineup_status", "pitcher_throws"):
+    for dimension in (
+        "model_version", "projection_band", "confidence", "season", "month",
+        "lineup_status", "pitcher_throws",
+    ):
         groups = defaultdict(list)
         for row in settled:
             groups[str(row.get(dimension) or "unknown")].append(abs(row["error"]))
@@ -222,6 +308,62 @@ def load_rows(db_path=None, start=None, end=None):
         return [dict(row) for row in db.execute(query, params)]
 
 
+def load_hitter_recent_form_rows(db_path=None, start=None, end=None):
+    """Expand immutable pregame hitter snapshots into evaluation rows."""
+    clauses = ["s.target='hitter_spotlight'", "o.target_group='hitter_game'", "s.captured_at<s.scheduled_start"]
+    params = []
+    if start:
+        clauses.append("s.captured_at>=?")
+        params.append(start)
+    if end:
+        clauses.append("s.captured_at<?")
+        params.append(end)
+    with connect(db_path) as db:
+        joined = db.execute(
+            f"""SELECT s.game_pk, s.player_id, s.captured_at, s.scheduled_start,
+                       s.features_json, o.outcomes_json
+                  FROM ml_feature_snapshots s
+                  JOIN settled_player_outcomes o
+                    ON o.game_pk=s.game_pk AND o.player_id=s.player_id
+                 WHERE {' AND '.join(clauses)}
+                 ORDER BY s.scheduled_start, s.game_pk, s.player_id""",
+            params,
+        ).fetchall()
+    rows = []
+    for joined_row in joined:
+        features = json.loads(joined_row["features_json"])
+        outcomes = json.loads(joined_row["outcomes_json"])
+        form = features.get("recent_form") or {}
+        items = ((features.get("opportunities") or {}).get("items") or {})
+        for outcome, opportunity in items.items():
+            actual = {
+                "hit": outcomes.get("one_plus_hit"),
+                "total_bases": outcomes.get("one_plus_total_base"),
+                "home_run": int((outcomes.get("home_runs") or 0) > 0),
+                "runs_rbi": outcomes.get("run_or_rbi"),
+                "overall": outcomes.get("one_plus_hit"),
+            }.get(outcome)
+            coverage = float((opportunity.get("requirements") or {}).get("coverage") or 0.0)
+            actual_coverage = float(opportunity.get("coverage") or features.get("coverage") or 0.0)
+            form_pa = int(form.get("pa") or 0)
+            rows.append({
+                "game_pk": joined_row["game_pk"], "player_id": joined_row["player_id"],
+                "outcome": outcome, "actual": actual,
+                "score": opportunity.get("score"),
+                "recent_form_adjustment": opportunity.get("recent_form_adjustment"),
+                "recent_form_score": form.get("score"),
+                "confidence": opportunity.get("confidence"),
+                "coverage_band": (
+                    "below_gate" if actual_coverage < coverage else
+                    "25-34%" if actual_coverage < .35 else
+                    "35-49%" if actual_coverage < .50 else "50%+"
+                ),
+                "recent_form_pa_band": "<20" if form_pa < 20 else "20-34" if form_pa < 35 else "35+",
+                "window_days": form.get("window_days"),
+            })
+    return rows
+
+
 def main():
     parser = argparse.ArgumentParser(description="Evaluate immutable pitcher-prop predictions chronologically")
     parser.add_argument("--start")
@@ -231,6 +373,9 @@ def main():
     initialize()
     rows = load_rows(start=args.start, end=args.end)
     report = evaluate(rows)
+    report["hitter_recent_form"] = evaluate_hitter_recent_form(
+        load_hitter_recent_form_rows(start=args.start, end=args.end)
+    )
     with connect() as db:
         versions = db.execute("SELECT model_version, feature_version FROM model_predictions ORDER BY prediction_id DESC LIMIT 1").fetchone()
         if versions:

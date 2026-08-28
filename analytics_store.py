@@ -532,6 +532,36 @@ MIGRATIONS = (
     CREATE INDEX IF NOT EXISTS idx_batter_spray_lookup
       ON gameday_batter_spray(season, player_id, bat_side, pitcher_throws, pitch_code);
     """),
+    (12, """
+    CREATE TABLE IF NOT EXISTS batter_game_form (
+      game_pk INTEGER NOT NULL,
+      scheduled_start TEXT,
+      game_date TEXT NOT NULL,
+      player_id INTEGER NOT NULL,
+      player_name TEXT,
+      team_id INTEGER,
+      opponent_id INTEGER,
+      is_start INTEGER NOT NULL DEFAULT 0 CHECK (is_start IN (0, 1)),
+      plate_appearances INTEGER NOT NULL,
+      at_bats INTEGER NOT NULL,
+      hits INTEGER NOT NULL,
+      walks INTEGER NOT NULL,
+      hit_by_pitch INTEGER NOT NULL,
+      sacrifice_flies INTEGER NOT NULL,
+      total_bases INTEGER NOT NULL,
+      doubles INTEGER NOT NULL,
+      triples INTEGER NOT NULL,
+      home_runs INTEGER NOT NULL,
+      strikeouts INTEGER NOT NULL,
+      observed_at TEXT NOT NULL,
+      source TEXT NOT NULL DEFAULT 'mlb-gameday-boxscore',
+      PRIMARY KEY (game_pk, player_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_batter_game_form_player_time
+      ON batter_game_form(player_id, scheduled_start, game_date);
+    CREATE TRIGGER IF NOT EXISTS immutable_batter_game_form_update BEFORE UPDATE ON batter_game_form BEGIN SELECT RAISE(ABORT, 'batter_game_form is immutable'); END;
+    CREATE TRIGGER IF NOT EXISTS immutable_batter_game_form_delete BEFORE DELETE ON batter_game_form BEGIN SELECT RAISE(ABORT, 'batter_game_form is immutable'); END;
+    """),
 )
 
 def connect(db_path=None):

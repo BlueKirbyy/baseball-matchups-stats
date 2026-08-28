@@ -456,6 +456,68 @@ def completed_game_observations(feed, observed_at=None):
     return output
 
 
+def completed_batter_game_forms(feed, observed_at=None):
+    """Return immutable official batting lines for leakage-safe rolling form.
+
+    MLB's box score supplies walks, hit by pitches, and sacrifice flies that are
+    required for a real OBP denominator.  These rows are intentionally separate
+    from the older observation table so historical immutable rows are never
+    rewritten during the migration.
+    """
+    observed_at = observed_at or utc_now()
+    game_data = feed.get("gameData", {})
+    game_pk = (game_data.get("game") or {}).get("pk")
+    scheduled_start = (game_data.get("datetime") or {}).get("dateTime")
+    game_date = (game_data.get("datetime") or {}).get("officialDate", "")
+    teams = game_data.get("teams") or {}
+    boxscore = ((feed.get("liveData") or {}).get("boxscore") or {}).get("teams") or {}
+
+    def integer(value):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
+    rows = []
+    for side in ("away", "home"):
+        opponent = "home" if side == "away" else "away"
+        team_box = boxscore.get(side) or {}
+        starters = {integer(player_id) for player_id in team_box.get("battingOrder") or []}
+        players = team_box.get("players") or {}
+        for player in players.values() if isinstance(players, dict) else []:
+            person = player.get("person") or {}
+            stats = ((player.get("stats") or {}).get("batting") or {})
+            player_id = integer(person.get("id"))
+            pa = integer(stats.get("plateAppearances"))
+            if not player_id or not pa:
+                continue
+            hits = integer(stats.get("hits"))
+            doubles = integer(stats.get("doubles"))
+            triples = integer(stats.get("triples"))
+            home_runs = integer(stats.get("homeRuns"))
+            total_bases = integer(stats.get("totalBases"))
+            if not total_bases:
+                singles = max(0, hits - doubles - triples - home_runs)
+                total_bases = singles + 2 * doubles + 3 * triples + 4 * home_runs
+            rows.append({
+                "game_pk": integer(game_pk), "scheduled_start": scheduled_start,
+                "game_date": game_date, "player_id": player_id,
+                "player_name": person.get("fullName"),
+                "team_id": (teams.get(side) or {}).get("id"),
+                "opponent_id": (teams.get(opponent) or {}).get("id"),
+                "is_start": int(player_id in starters),
+                "plate_appearances": pa, "at_bats": integer(stats.get("atBats")),
+                "hits": hits, "walks": integer(stats.get("baseOnBalls")),
+                "hit_by_pitch": integer(stats.get("hitByPitch")),
+                "sacrifice_flies": integer(stats.get("sacFlies")),
+                "total_bases": total_bases, "doubles": doubles, "triples": triples,
+                "home_runs": home_runs, "strikeouts": integer(stats.get("strikeOuts")),
+                "runs": integer(stats.get("runs")), "rbi": integer(stats.get("rbi")),
+                "observed_at": observed_at,
+            })
+    return rows
+
+
 def save_completed_game_observations(feed, db):
     columns = (
         "game_pk", "game_date", "player_id", "player_name", "team_id", "opponent_id", "role", "is_start",
@@ -481,6 +543,40 @@ def save_completed_game_observations(feed, db):
                     row["runs_allowed"], row["earned_runs"], row["observed_at"],
                 ),
             )
+    form_columns = (
+        "game_pk", "scheduled_start", "game_date", "player_id", "player_name",
+        "team_id", "opponent_id", "is_start", "plate_appearances", "at_bats",
+        "hits", "walks", "hit_by_pitch", "sacrifice_flies", "total_bases",
+        "doubles", "triples", "home_runs", "strikeouts", "observed_at",
+    )
+    form_placeholders = ",".join("?" for _ in form_columns)
+    for row in completed_batter_game_forms(feed):
+        db.execute(
+            f"INSERT OR IGNORE INTO batter_game_form({','.join(form_columns)}, source) "
+            f"VALUES ({form_placeholders}, 'mlb-gameday-boxscore')",
+            tuple(row[column] for column in form_columns),
+        )
+        db.execute(
+            """INSERT OR IGNORE INTO settled_player_outcomes(
+                 game_pk, game_date, player_id, player_name, target_group,
+                 outcomes_json, settled_at, source
+               ) VALUES (?, ?, ?, ?, 'hitter_game', ?, ?, 'mlb-gameday-boxscore')""",
+            (
+                row["game_pk"], row["game_date"], row["player_id"], row["player_name"],
+                json.dumps({
+                    "plate_appearances": row["plate_appearances"],
+                    "at_bats": row["at_bats"], "hits": row["hits"],
+                    "walks": row["walks"], "hit_by_pitch": row["hit_by_pitch"],
+                    "total_bases": row["total_bases"], "home_runs": row["home_runs"],
+                    "strikeouts": row["strikeouts"],
+                    "one_plus_hit": int(row["hits"] > 0),
+                    "one_plus_total_base": int(row["total_bases"] > 0),
+                    "runs": row["runs"], "rbi": row["rbi"],
+                    "run_or_rbi": int(row["runs"] + row["rbi"] > 0),
+                }, sort_keys=True),
+                row["observed_at"],
+            ),
+        )
 
 def process_feed(feed, pitcher_ids, batter_ids, pitcher_data, pitcher_context_data, batter_events, batter_pitch_events, batter_pitch_zones, batter_velocity_events, batter_context_events, batter_quality, pitcher_workloads, batter_discipline=None, batter_spray=None):
     game_lines = defaultdict(lambda: {"batters_faced": 0, "strikeouts": 0, "outs": 0, "pitches": 0})
