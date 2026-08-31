@@ -259,8 +259,4 @@ An empty report is expected until immutable predictions are saved and settled. H
 - Park geometry and umpire history remain descriptive in model v4. The raw umpire K% is excluded because it is confounded by assigned players. Hitter pitch cells and their priors use the opposing pitcher's throwing-hand split, with clearly labeled all-hand fallback when the split is too sparse.
 - Hitter contact research is shrinkage-aware. Separate hit/XBH/HR/K challengers run in shadow with calibrated out-of-time probabilities, but they do not affect the empirical rankings until a target clears its promotion gate. Bullpen exposure remains a weighted descriptive blend, not a calibrated simulation of manager decisions.
 
-## Adding a provider or prop
-
-Normalize a provider response to the `market_snapshots` fields and call `add_market_snapshot`; keep network/authentication details outside model code. A new prop needs a versioned server-side target model, immutable prediction schema compatibility, settlement mapping, walk-forward evaluation, tests, UI labeling, and a model-card update before any action label is enabled.
-
 Use this tool as research support.
