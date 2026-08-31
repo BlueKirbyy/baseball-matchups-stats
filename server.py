@@ -1,4 +1,4 @@
-"""No-key local server for the Diamond Intel MLB matchup board."""
+"""No-key local server for the Baseball Research MLB matchup board."""
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
@@ -1265,5 +1265,5 @@ class Handler(SimpleHTTPRequestHandler):
 
 if __name__ == "__main__":
     initialize()
-    print(f"Diamond Intel is running at http://localhost:{PORT}")
+    print(f"Baseball Research is running at http://localhost:{PORT}")
     ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()

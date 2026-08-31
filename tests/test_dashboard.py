@@ -44,6 +44,19 @@ class DashboardSpotlightTests(unittest.TestCase):
         self.assertIn("renderGames();if(matchupView){renderDetail();", self.page)
         self.assertNotIn("renderGames();renderDetail()", self.page)
 
+    def test_research_shell_accounts_for_the_fixed_navigation_rail(self):
+        self.assertIn("main{width:calc(100% - var(--rail));margin-left:var(--rail)", self.page)
+        self.assertIn("@media(max-width:1000px)", self.page)
+        self.assertIn("main{width:100%}", self.page)
+        self.assertIn(".game{width:100%;max-width:100%;overflow:hidden", self.page)
+
+    def test_scorebug_does_not_fake_a_pregame_count(self):
+        self.assertIn("Pregame · count opens at first pitch", self.page)
+        self.assertIn("isLive=/in progress|live/i.test(status)", self.page)
+        self.assertIn("scorebug.classList.toggle('live',isLive)", self.page)
+        self.assertNotIn(".count-dots.lime i:first-child", self.page)
+        self.assertNotIn(".count-dots.red i:first-child", self.page)
+
     def test_matchup_view_is_full_width_without_panel_bars(self):
         self.assertIn(".matchup-view main{width:100%;max-width:none;padding:0}", self.page)
         self.assertIn(".matchup-view #detail{width:100%;max-width:none;margin:0", self.page)

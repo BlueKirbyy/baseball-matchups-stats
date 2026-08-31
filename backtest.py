@@ -1,4 +1,4 @@
-"""Walk-forward evaluation for immutable Diamond Intel predictions."""
+"""Walk-forward evaluation for immutable Baseball Research predictions."""
 from __future__ import annotations
 
 import argparse

@@ -1,4 +1,4 @@
-# Diamond Intel model card
+# Baseball Research model card
 
 ## Pitcher strikeouts: `pitcher-k-workload-v4`
 

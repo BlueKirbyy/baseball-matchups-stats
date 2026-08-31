@@ -1,4 +1,4 @@
-"""SQLite storage and non-destructive migrations for Diamond Intel."""
+"""SQLite storage and non-destructive migrations for Baseball Research."""
 from pathlib import Path
 import sqlite3
 

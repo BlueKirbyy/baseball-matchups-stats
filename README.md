@@ -1,6 +1,6 @@
-# Diamond Intel
+# Baseball Research
 
-Diamond Intel is a local MLB matchup and player-prop research board. It combines MLB Gameday pitch feeds, confirmed lineups, pitcher workload, pitch-mix evidence, game context, and timestamped prop prices.
+Baseball Research is a local MLB matchup and player-prop research board. It combines MLB Gameday pitch feeds, confirmed lineups, pitcher workload, pitch-mix evidence, game context, and timestamped prop prices.
 
 The current pitcher-strikeout model is an unvalidated research baseline. The application intentionally does not call a projection a profitable edge until walk-forward results demonstrate calibration and value.
 

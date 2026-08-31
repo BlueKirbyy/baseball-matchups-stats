@@ -1,4 +1,4 @@
-"""Compatibility command for the Diamond Intel local matchup sync.
+"""Compatibility command for the Baseball Research local matchup sync.
 
 This no longer scrapes Baseball Savant player pages. It delegates to the MLB
 Gameday pitch-feed sync, retaining the familiar command name.

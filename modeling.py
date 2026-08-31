@@ -1,4 +1,4 @@
-"""Versioned, server-side models and market math for Diamond Intel.
+"""Versioned, server-side models and market math for Baseball Research.
 
 The initial model is intentionally a conservative empirical-Bayes baseline. It
 is a research model until walk-forward results establish calibration and value.
