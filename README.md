@@ -13,7 +13,6 @@ The current pitcher-strikeout model is an unvalidated research baseline. The app
 - `pitcher_ml.py` / `train_pitcher_ml.py`: chronological starter-game features, workload challengers, dependency-free shadow inference, and the workload-driven K distribution.
 - `prediction_store.py`: append-only pregame, market, prediction, and result records.
 - `market_data.py`: sportsbook/pick'em CSV and manual market import.
-- `backtest.py`: chronological evaluation, calibration, distribution comparison, ROI, and same-line CLV.
 - `server.py`: localhost API and static server.
 - `index.html`: responsive daily prop board and detailed pitch research. It displays server-computed statistics; model formulas no longer live in browser JavaScript.
 - `diamond_intel.db`: the existing local database. Initialization migrates it in place and does not delete existing tables.
@@ -212,20 +211,6 @@ curl -X POST http://127.0.0.1:8000/api/predictions \
 ```
 
 Confirmed-lineup predictions are saved automatically the first time slate or matchup research loads. After a game becomes final, the server settles strikeouts, batters faced, pitches, outs, runs, earned runs, hits, and walks from the free MLB box score. Predictions and results are append-only and cannot be overwritten.
-
-## Backtest
-
-Evaluate all settled predictions:
-
-```bash
-python3 backtest.py --json backtest-report.json
-```
-
-Optional chronological range:
-
-```bash
-python3 backtest.py --start 2026-05-01T00:00:00Z --end 2026-07-01T00:00:00Z
-```
 
 The evaluator excludes predictions whose `as_of` is not earlier than scheduled first pitch. It reports K MAE/RMSE plus separate batters-faced, pitch-count, outs, and K-rate error. Probability calibration and market comparisons are added when a timestamped line/price exists.
 
